@@ -1,0 +1,20 @@
+{
+  "domain": "debugging",
+  "description": "问题排查——适用于坎卦（险陷）的调试与深潜模式",
+  "version": "1.0",
+  "trigram": "kan",
+  "proficiency": 0.0,
+  "last_used": "",
+  "models": [],
+  "skills": [],
+  "workflow": [
+    {"step": 1, "description": "确认错误现象和触发条件，复现问题", "skills": []},
+    {"step": 2, "description": "从报错信息反向追踪代码路径", "skills": []},
+    {"step": 3, "description": "逐个排除可能的原因，隔离变量", "skills": []},
+    {"step": 4, "description": "定位到导致问题的确切根因", "skills": []},
+    {"step": 5, "description": "评估修复方案的风险和影响", "skills": []},
+    {"step": 6, "description": "最小化修改实施修复", "skills": []},
+    {"step": 7, "description": "验证 bug 已解决且无副作用", "skills": []}
+  ],
+  "gaps": []
+}

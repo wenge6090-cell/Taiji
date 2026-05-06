@@ -1,0 +1,18 @@
+{
+  "domain": "clarification",
+  "description": "需求澄清——适用于离卦（明照）的澄清与文档模式",
+  "version": "1.0",
+  "trigram": "li",
+  "proficiency": 0.0,
+  "last_used": "",
+  "models": [],
+  "skills": [],
+  "workflow": [
+    {"step": 1, "description": "标记所有模糊、多义的表述，识别歧义", "skills": []},
+    {"step": 2, "description": "区分宏观目标和具体任务，拆解粒度", "skills": []},
+    {"step": 3, "description": "列出显式和隐式的约束条件", "skills": []},
+    {"step": 4, "description": "具体化完成的定义和标准", "skills": []},
+    {"step": 5, "description": "检查各约束之间是否存在矛盾", "skills": []}
+  ],
+  "gaps": []
+}

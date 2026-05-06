@@ -1,0 +1,18 @@
+{
+  "domain": "communication",
+  "description": "沟通汇报——适用于兑卦（喜悦）的沟通与汇报模式",
+  "version": "1.0",
+  "trigram": "dui",
+  "proficiency": 0.0,
+  "last_used": "",
+  "models": [],
+  "skills": [],
+  "workflow": [
+    {"step": 1, "description": "理解受众需求，确定沟通目标", "skills": []},
+    {"step": 2, "description": "按优先级排列核心信息要点", "skills": []},
+    {"step": 3, "description": "用最简洁的文字传达最多信息", "skills": []},
+    {"step": 4, "description": "引用具体代码或数据支撑观点", "skills": []},
+    {"step": 5, "description": "如果有待办事项，清晰列出并明确责任", "skills": []}
+  ],
+  "gaps": []
+}

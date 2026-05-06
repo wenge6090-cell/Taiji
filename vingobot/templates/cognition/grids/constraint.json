@@ -1,0 +1,17 @@
+{
+  "domain": "constraint",
+  "description": "约束执行——适用于艮卦（静止）的约束与精简模式",
+  "version": "1.0",
+  "trigram": "gen",
+  "proficiency": 0.0,
+  "last_used": "",
+  "models": [],
+  "skills": [],
+  "workflow": [
+    {"step": 1, "description": "盘点当前可用的工具和能力资源", "skills": []},
+    {"step": 2, "description": "评估在约束条件下能否完成目标", "skills": []},
+    {"step": 3, "description": "用最少的操作步骤达成目标", "skills": []},
+    {"step": 4, "description": "如果无法完成，明确说明缺少什么条件", "skills": []}
+  ],
+  "gaps": []
+}

@@ -1,0 +1,18 @@
+{
+  "domain": "analysis",
+  "description": "深度分析——适用于巽卦（随风巽）的分析与分解模式",
+  "version": "1.0",
+  "trigram": "xun",
+  "proficiency": 0.0,
+  "last_used": "",
+  "models": [],
+  "skills": [],
+  "workflow": [
+    {"step": 1, "description": "确定分析的标准和维度", "skills": []},
+    {"step": 2, "description": "采集相关代码和数据源信息", "skills": []},
+    {"step": 3, "description": "从表层到深层逐层解析，分层分析", "skills": []},
+    {"step": 4, "description": "从多个角度交叉验证分析结论", "skills": []},
+    {"step": 5, "description": "结构化呈现分析结果", "skills": []}
+  ],
+  "gaps": []
+}

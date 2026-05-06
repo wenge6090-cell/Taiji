@@ -1,0 +1,18 @@
+{
+  "domain": "problem-solving",
+  "description": "问题求解——适用于震卦（万物出乎震）的重构与求解模式",
+  "version": "1.0",
+  "trigram": "zhen",
+  "proficiency": 0.0,
+  "last_used": "",
+  "models": [],
+  "skills": [],
+  "workflow": [
+    {"step": 1, "description": "用一句话描述要解决的核心问题", "skills": []},
+    {"step": 2, "description": "将复杂问题分解为独立可解的子问题", "skills": []},
+    {"step": 3, "description": "逐个击破每个子问题：搜索→分析→方案→验证", "skills": []},
+    {"step": 4, "description": "将所有子方案组合成完整的解决方案", "skills": []},
+    {"step": 5, "description": "全局验证组合后的方案是否自洽完备", "skills": []}
+  ],
+  "gaps": []
+}

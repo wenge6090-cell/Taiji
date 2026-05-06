@@ -1,0 +1,19 @@
+{
+  "domain": "exploration",
+  "description": "探索性分析——适用于乾卦（天行健，君子以自强不息）的探索与创新模式",
+  "version": "1.0",
+  "trigram": "qian",
+  "proficiency": 0.0,
+  "last_used": "",
+  "models": [],
+  "skills": [],
+  "workflow": [
+    {"step": 1, "description": "明确探索边界和关键问题", "skills": []},
+    {"step": 2, "description": "收集信息、读取相关文件、搜索关键词", "skills": []},
+    {"step": 3, "description": "识别代码结构、架构模式和数据流", "skills": []},
+    {"step": 4, "description": "形成初步假设，标记不确定区域", "skills": []},
+    {"step": 5, "description": "用具体证据验证或推翻假设", "skills": []},
+    {"step": 6, "description": "产出结构化理解（模块图、数据流图）", "skills": []}
+  ],
+  "gaps": []
+}

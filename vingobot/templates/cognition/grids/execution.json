@@ -1,0 +1,18 @@
+{
+  "domain": "execution",
+  "description": "精准执行——适用于坤卦（厚德载物）的执行与落地模式",
+  "version": "1.0",
+  "trigram": "kun",
+  "proficiency": 0.0,
+  "last_used": "",
+  "models": [],
+  "skills": [],
+  "workflow": [
+    {"step": 1, "description": "明确要产出的具体目标和交付物", "skills": []},
+    {"step": 2, "description": "将目标分解为可执行的小步骤", "skills": []},
+    {"step": 3, "description": "依次执行，每步一个工具调用，读→写→验证", "skills": []},
+    {"step": 4, "description": "每步执行后确认产出是否正确", "skills": []},
+    {"step": 5, "description": "完成后调用 task_complete 提交结果", "skills": []}
+  ],
+  "gaps": []
+}

@@ -1,0 +1,33 @@
+{
+  "version": 1,
+  "updated_at": "2026-05-03T00:00:00Z",
+  "title": "安全真理 — Safety Truth",
+  "type": "safety",
+  "immutable": true,
+  "rules": [
+    {
+      "id": "safety-001",
+      "statement": "永远不执行破坏性系统命令：rm -rf、format、dd、shutdown、reboot、mkfs、chmod 777 等。"
+    },
+    {
+      "id": "safety-002",
+      "statement": "永远不允许路径穿越攻击：禁止包含 '..' 的文件路径写入操作。"
+    },
+    {
+      "id": "safety-003",
+      "statement": "认知层路径 (.taiji/cognition/) 受保护，禁止直接写入。认知层更新必须通过 Anqu 决策驱动的认知演化任务。"
+    },
+    {
+      "id": "safety-004",
+      "statement": "配置文件 (config.json) 受保护，禁止直接写入。配置变更应通过用户意图驱动。"
+    },
+    {
+      "id": "safety-005",
+      "statement": "写入操作必须限制在工作区内。绝对路径指向工作区外的写操作一律拒绝。"
+    },
+    {
+      "id": "safety-006",
+      "statement": "不使用 sudo、su 等提权命令执行任何操作。"
+    }
+  ]
+}
