@@ -338,7 +338,35 @@ See the [`docs/`](./docs) directory for detailed guides:
 - [Agent Social Network](./docs/agent-social-network.md)
 
 ---
+### Thinkers and Works
 
+**I Ching (《易经》)** — The Book of Changes is the philosophical and structural foundation of the entire Taiji architecture. The core mechanisms of this project are directly inspired by its core concepts:
+
+- **六爻 (Liuyao / Six Lines)** — The six-stage execution cycle that governs the agent's task progression, from initial observation (初爻) through action, refinement, mastery, to meta-cognitive reflection and return (上爻). This is the cognitive engine that drives the Taiji agent's goal-oriented behavior.
+- **八卦 (Bagua / Eight Trigrams)** — The eight situational routing patterns (乾·创造, 坤·承载, 震·启动, 巽·渗透, 坎·险陷, 离·明照, 艮·静止, 兑·喜悦) that dynamically guide the agent's cognitive stance and tool selection based on the current task context.
+- **四象 (Sixiang / Four Images)** — The four dynamic cognitive modes (老阳·发散探索, 少阳·聚焦感知, 少阴·精准执行, 老阴·批判反思) that govern the agent's thinking temperature and output style at each step.
+
+The I Ching's central insight — that all things are in continuous transformation through cyclical patterns — directly informs this system's design principle: **cognition evolves through structured cycles, not linear accumulation.** The 编织器 (Weaver) ensures that each cycle begins fresh, unpolluted by the language habits of previous rounds, while the 暗驱 (Anqu) ensures that long-term goals persist across cycles. This is a computational homage to the ancient wisdom that stillness and motion, emptiness and form, are not opposites but complementary phases of a single cosmic breath.
+
+**Charlie Munger** and his book *Poor Charlie's Almanack* — Mr. Munger's "Multiple Mental Models" and "Latticework of Mental Models" are the cornerstone of this project's "Cognitive Grills" concept, encouraging us to transcend disciplinary boundaries and build cognitive networks that connect different knowledge domains.
+
+**Ray Dalio** and his book *Principles* — Dalio's systematic principle-based thinking and believability-weighted decision-making methods provide valuable references for our "Underlying Truths" extraction and value judgment mechanisms in "Dream Management."
+
+**Wang Yangming (王阳明)** and his philosophy of "Unity of Knowledge and Action (知行合一)" from *Instructions for Practical Living (《传习录》)* — The core concepts of "Knowledge is the beginning of action, and action is the completion of knowledge" and "Where knowledge is genuine and solid, that is action; where action is clear and perceptive, that is knowledge" profoundly influenced the design of this system's "Unity of Knowledge and Action Verification" mechanism. We believe that true cognition must be validated through action, and every action should deepen cognition. This aligns perfectly with the system's compression evolution process of "Event Experiences → Mental Models → Underlying Truths." Particularly, the idea that "the moment a thought arises is action" provides important inspiration for our design of the closed-loop mechanism between "Meta-Awareness" and "Dream-Driven" evolution.
+
+**The Secret of the Golden Flower (《太乙金华宗旨》)** (attributed to Lü Dongbin 吕洞宾) — This Taoist classic's teachings on inner observation, returning light, and golden flower cultivation inspired us to incorporate Eastern philosophical introspection wisdom into "Meta-Awareness" and the "Self Awareness Layer," pursuing the introspection and evolution of consciousness.
+
+**Daniel Kahneman** and his book *Thinking, Fast and Slow* — Professor Kahneman's cognitive model of System 1 and System 2 directly influenced the design of this system's "Awake/Asleep" state switching, simulating the alternation between human rapid intuition and deep reflection.
+
+### Open Source Projects
+
+**DeepSeek's Engram Project** (deepseek-ai/Engram) — The Engram project's exploration in long-term memory and knowledge management provides important technical inspiration for our "Life Memory System" and "Associative Memory Network."
+
+**The University of Hong Kong's Nanobot Project** — This project's innovative work in cognitive architecture or robotics inspired our thinking about system autonomy and emotional mechanisms.
+
+These contributors have illuminated our design path in different ways. We hereby express our sincere thanks.
+
+---
 ## License
 
 Licensed under the **Apache License, Version 2.0** (the "License");
