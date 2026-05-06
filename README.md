@@ -1,7 +1,7 @@
 <div align="center">
-  <h1>🐈 Vingobot</h1>
-  <p><em>六爻循环 Agent — 协程池驱动的双层目标循环框架</em></p>
-  <p>A lightweight AI agent framework with native multi-channel messaging, multi-LLM provider support, and an innovative goal-driven coroutine architecture.</p>
+  <h1>☯️ Taiji Agent</h1>
+  <p><em>A dual-core cognitive architecture based on the 六爻 (Liuyao) cycle</em></p>
+  <p>Also running as 🐈 Vingobot — a lightweight, multi-channel AI agent with goal-driven coroutines.</p>
 
   <p>
     <img src="https://img.shields.io/badge/python-%3E%3D3.11-blue" alt="Python 3.11+" />
@@ -14,11 +14,11 @@
 
 ## Overview
 
-**Vingobot** is an AI agent framework built on the **六爻循环 (Sixiang/Liuyao Cycle)** architecture — a dual-loop coroutine-driven design that separates goal-level planning from task-level execution. It combines:
+**Vingobot** is an AI agent framework built on the **六爻循环 (Liuyao Cycle)** architecture — a dual-loop coroutine-driven design that separates goal-level planning from task-level execution. It combines:
 
 - **🧠 Multi-LLM support** — OpenAI, Anthropic, DeepSeek, Gemini, Groq, local models (Ollama, LM Studio), and 20+ providers via a unified interface
 - **📨 Multi-channel messaging** — Telegram, Discord, Feishu/Lark, DingTalk, Slack, QQ, WeChat Work (企业微信), Weixin (微信), Email, Matrix, WhatsApp, Microsoft Teams, and WebSocket — all with a shared agent core
-- **🎯 Sixiang (六爻) mode** — A coroutine pool for goal-driven autonomous task execution, with a cognition hierarchy (skills → models → grids → truths)
+- **🎯 Liuyao (六爻) mode** — A coroutine pool for goal-driven autonomous task execution, with a cognition hierarchy (skills → models → grids → truths → soul)
 - **🔧 Tool-agnostic execution** — Native function calling, MCP servers, command execution, web search, file I/O, and a plugin tool system
 - **💭 Dream (consolidation)** — Automatic memory consolidation that summarizes and compresses long-running conversations
 - **🔌 Extensible** — Plugin architecture for channels, tools, provider backends, and lifecycle hooks
@@ -32,15 +32,17 @@
 | **LLM Providers** | OpenAI, Anthropic, DeepSeek, Gemini, Groq, Ollama, LM Studio, vLLM, OpenRouter, Azure OpenAI, Bedrock, HuggingFace, Zhipu (智谱), DashScope (通义千问), Moonshot (月之暗面), MiniMax, Mistral, StepFun (阶跃星辰), SiliconFlow, Volcengine (火山引擎), BytePlus, Baidu Qianfan (百度千帆), AIHubMix, GitHub Copilot, and more |
 | **Chat Channels** | Telegram, Discord, Feishu/Lark, DingTalk, Slack, QQ, WeChat Work (企业微信), Weixin (微信), Email (IMAP/SMTP), Matrix, WhatsApp, Microsoft Teams, WebSocket, Mochat |
 | **Agent Core** | Session management, tool-use loops, context window optimization, streaming responses, auto-compaction, memory consolidation, skill loading, MCP integration |
-| **六爻 (Sixiang)** | Coroutine worker pool, goal-driven task decomposition, cognition hierarchy (L1 skills → L2 models → L3 grids → L4 truths), inner task loop (Weaver → Yang → Yin → Executor), outer decision loop (Mingjue → Anqu) |
+| **六爻 (Liuyao)** | Coroutine worker pool, goal-driven task decomposition, cognition hierarchy (L1 skills → L2 models → L3 grids → L4 truths → L5 soul), inner task loop (Weaver → Yang → Yin → Executor), outer decision loop (Mingjue → Anqu) |
 | **Tools** | Web search (DuckDuckGo, custom), web fetch (Jina Reader), file I/O, command execution, code execution, MCP servers, cron scheduling, TPN (pool control), DMN (decision management), custom user tools |
 | **Extras** | Dream consolidation, heartbeat service, OpenAI-compatible API server, WebSocket gateway, rich CLI (prompt_toolkit), programmatic Python SDK |
 
 ---
 
-## Architecture: The 六爻 (Sixiang) Cycle
+## Architecture: The 六爻 (Liuyao) Cycle
 
 Vingobot's core innovation is the **六爻循环** — a dual-loop architecture inspired by the six lines (六爻) of the I Ching:
+
+The core of Vingobot is a dual-loop architecture inspired by the I Ching's six lines (六爻). The **Outer Loop** handles goal-level planning and decision, while the **Inner Loop** executes tasks through a sequence of specialized cognitive agents.
 
 ```
 ┌─────────────────────────────────────────────────────┐
@@ -125,8 +127,8 @@ vingobot agent
 | `vingobot gateway` | Start gateway (channel + API server) |
 | `vingobot status` | Show runtime status |
 | `vingobot cron` | Manage scheduled tasks |
-| `vingobot sixiang goal list` | List all sixiang goals |
-| `vingobot sixiang queue list` | View task queue |
+| `vingobot liuyao goal list` | List all liuyao goals |
+| `vingobot liuyao queue list` | View task queue |
 | `vingobot channels login <name>` | Login to a chat channel |
 | `vingobot channels list` | List configured channels |
 
@@ -210,9 +212,9 @@ Providers are auto-detected from the model name, or explicitly configured with `
 
 ---
 
-## Sixiang Mode (Goal-Driven Autonomous Execution)
+## Liuyao Mode (Goal-Driven Autonomous Execution)
 
-The **六爻 (Sixiang)** mode enables goal-driven autonomous task execution through a coroutine worker pool:
+The **六爻 (Liuyao)** mode enables goal-driven autonomous task execution through a coroutine worker pool:
 
 ```python
 from vingobot import vingobot
@@ -225,7 +227,7 @@ await bot.stop_sixiang()
 
 ### Cognition Hierarchy
 
-The六爻 system maintains a four-layer cognition workspace:
+The 六爻 system maintains a five-layer cognition workspace:
 
 ```
 ~/.vingobot/.taiji/
@@ -233,11 +235,14 @@ The六爻 system maintains a four-layer cognition workspace:
 ├── cognition/
 │   ├── skills/           ← L1 Skill library
 │   ├── models/           ← L2 Experience models
-│   ├── grids/            ← L3 Cognition grids
-│   └── truths/           ← L4 Immutable truths
+│   ├── grids/            ← L3 Cognition grids (including meta-grids: 四象, 六爻, 八卦)
+│   ├── truths/           ← L4 Immutable truths
+│   └── soul/             ← L5 Self-model (identity, narrative, temporal memory)
 └── goals/
     └── default/          ← Default dialogue target
 ```
+
+L5 Soul (灵魂) stores the agent's self-model, including identity foundation, self-cognition, social others model, and temporal narrative.
 
 ---
 
@@ -256,7 +261,7 @@ async def main():
     result = await bot.run("What's the weather today?")
     print(result.content)
 
-    # Sixiang mode (goal-driven)
+    # Liuyao mode (goal-driven)
     pool = await bot.start_sixiang(workers=3)
     # ... let it run ...
     await bot.stop_sixiang()
