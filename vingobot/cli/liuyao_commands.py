@@ -1,12 +1,12 @@
 """
-六爻 CLI 命令 — vingobot sixiang 子命令组。
+六爻 CLI 命令 — vingobot liuyao 子命令组。
 
 Commands:
-    vingobot sixiang goal list     列出所有目标
-    vingobot sixiang goal show ID  查看目标详情
-    vingobot sixiang goal new ID   创建新目标
-    vingobot sixiang queue list    查看待办队列
-    vingobot sixiang queue add DESC 添加任务到队列
+    vingobot liuyao goal list     列出所有目标
+    vingobot liuyao goal show ID  查看目标详情
+    vingobot liuyao goal new ID   创建新目标
+    vingobot liuyao queue list    查看待办队列
+    vingobot liuyao queue add DESC 添加任务到队列
 
 Note: 六爻协程池的启动/停止由 Agent 内部 TPN 工具控制，
 """
@@ -15,12 +15,12 @@ from __future__ import annotations
 
 import typer
 
-sixiang_app = typer.Typer(help="六爻目标驱动循环", no_args_is_help=True)
+liuyao_app = typer.Typer(help="六爻目标驱动循环", no_args_is_help=True)
 goal_app = typer.Typer(help="目标管理", no_args_is_help=True)
 queue_app = typer.Typer(help="任务队列管理", no_args_is_help=True)
 
-sixiang_app.add_typer(goal_app, name="goal")
-sixiang_app.add_typer(queue_app, name="queue")
+liuyao_app.add_typer(goal_app, name="goal")
+liuyao_app.add_typer(queue_app, name="queue")
 
 
 # ===========================================================================

@@ -1495,11 +1495,11 @@ channels_app = typer.Typer(help="Manage channels")
 app.add_typer(channels_app, name="channels")
 
 # ============================================================================
-# Sixiang (六爻) Commands
+# Liuyao (六爻) Commands
 # ============================================================================
 
-from vingobot.cli.sixiang_commands import sixiang_app
-app.add_typer(sixiang_app, name="sixiang")
+from vingobot.cli.liuyao_commands import liuyao_app
+app.add_typer(liuyao_app, name="liuyao")
 
 
 @channels_app.command("status")
