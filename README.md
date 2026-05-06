@@ -1,5 +1,5 @@
 <div align="center">
-  <h1>☯️ Taiji Agent</h1>
+  <h1>☯️ Taiji </h1>
   <p><em>A dual-core cognitive architecture based on the 六爻 (Liuyao) cycle</em></p>
   <p>Also running as 🐈 Vingobot — a lightweight, multi-channel AI agent with goal-driven coroutines.</p>
 
