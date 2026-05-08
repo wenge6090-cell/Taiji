@@ -32,7 +32,7 @@ _TRIGRAM_ROUTING: dict[str, dict[str, Any]] = {
         "label": "乾·天行",
         "energy": "creative",
         "suggested_grids": ["exploration", "creative-thinking"],
-        "suggested_skills": ["search_skills"],
+        "suggested_skills": ["read_file", "list_directory"],
     },
     "kun": {  # 坤 — execution, grounded
         "label": "坤·地势",
@@ -50,19 +50,19 @@ _TRIGRAM_ROUTING: dict[str, dict[str, Any]] = {
         "label": "巽·风入",
         "energy": "analytical",
         "suggested_grids": ["analysis", "decomposition"],
-        "suggested_skills": ["read_file", "search_skills", "load_grid"],
+        "suggested_skills": ["read_file", "list_directory"],
     },
     "kan": {  # 坎 — difficulty, depth
         "label": "坎·水险",
         "energy": "persistent",
         "suggested_grids": ["debugging", "deep-dive"],
-        "suggested_skills": ["read_file", "search_models", "load_grid"],
+        "suggested_skills": ["read_file", "list_directory"],
     },
     "li": {  # 离 — clarity, illumination
         "label": "离·火明",
         "energy": "illuminating",
         "suggested_grids": ["clarification", "documentation"],
-        "suggested_skills": ["read_file", "write_file", "search_skills"],
+        "suggested_skills": ["read_file", "write_file"],
     },
     "gen": {  # 艮 — stillness, boundary
         "label": "艮·山止",
@@ -97,6 +97,10 @@ async def run_mingjue(
     produce an output without an extra LLM round-trip.
     """
 
+    # --- Periodic reflection: force LLM re-assessment ---
+    if source.type == "periodic_reflection":
+        return await _from_initial(goal_context, source, signal)
+
     # --- Continuation: Anqu already provided a concrete next step ---
     if source.type == "anqu_continuation":
         return _from_continuation(goal_context, source)
@@ -118,13 +122,20 @@ def _from_continuation(goal_context: GoalContext, source: MingjueSource) -> Ming
     """Build a MingjueOutput from Anqu's structured continuation."""
     wp = get_workspace_paths()
 
+    # Use Anqu's suggested trigram if available, otherwise default to kun
+    trigram = source.suggested_trigram or "kun"
+    trigram_reason = (
+        f"暗驱续接，卦象: {trigram}" if source.suggested_trigram
+        else "暗驱续接，默认执行"
+    )
+
     return MingjueOutput(
         intent="task",
         goal_id=goal_context.goal_id,
         summary=source.description or "继续推进目标",
         concrete_goal=source.description or source.previous_task_summary,
-        trigram="kun",
-        trigram_reason="暗驱续接，默认执行",
+        trigram=trigram,
+        trigram_reason=trigram_reason,
         initial_yao=1,
         context=MingjueContextInfo(
             workspace_root=str(wp.root),
@@ -134,7 +145,7 @@ def _from_continuation(goal_context: GoalContext, source: MingjueSource) -> Ming
                 "models": str(wp.models),
                 "grids": str(wp.grids),
             },
-            memory_dir=str(wp.goals / goal_context.goal_id / "memory"),
+
             suggested_grids=["execution"],
         ),
     )
@@ -179,7 +190,7 @@ def _from_rework(
                 "models": str(wp.models),
                 "grids": str(wp.grids),
             },
-            memory_dir=str(wp.goals / goal_context.goal_id / "memory"),
+
         ),
     )
 
@@ -223,9 +234,14 @@ async def _from_initial(
 
 你拥有探索能力——在做出决策前，你可以：
 - 用 list_directory 查看目标目录结构
-- 用 read_file 读取阶段报告、蓝图、记忆等文件
-- 用 search_skills / search_models 搜索认知库
+- 用 read_file 读取阶段报告、蓝图、记忆、认知库等文件
 - 用 query_capabilities 了解当前执行环境能力
+
+认知库路径（可用 list_directory + read_file 探索）：
+- skills/ — L1 技能定义
+- models/ — L2 经验模型
+- grids/ — L3 认知格栅（JSON 含 source_truths/models/skills 跨层链接）
+- truths/ — L4 不可变底层真理
 
 **不要在信息不足时空想。先探索，再决策。**
 
@@ -257,8 +273,15 @@ async def _from_initial(
   "summary": "一句话总结本任务",
   "concrete_goal": "详细的任务描述，包含期望成果和约束",
   "trigram": "qian|kun|zhen|xun|kan|li|gen|dui",
-  "trigram_reason": "选择此卦的理由"
+  "trigram_reason": "选择此卦的理由",
+  "goal_progress_pct": 0-100
 }}
+
+**goal_progress_pct**: 基于当前蓝图、已完成任务和记忆，评估**目标整体**的完成百分比。
+- 新目标从 0 开始
+- 每个成功任务推进 10-30%
+- 客观评估，不要过度乐观
+- 暗驱稍后会复核你的判断
 
 直接输出 JSON，不要包裹在 markdown 代码块中。
 """
@@ -293,6 +316,7 @@ async def _from_initial(
 
     trigram = parsed.get("trigram", "kun")
     routing = _TRIGRAM_ROUTING.get(trigram, _TRIGRAM_ROUTING["kun"])
+    parsed_pct = _parse_progress_pct(parsed.get("goal_progress_pct"))
 
     return MingjueOutput(
         intent="task",
@@ -302,15 +326,16 @@ async def _from_initial(
         trigram=trigram,
         trigram_reason=parsed.get("trigram_reason", routing["label"]),
         initial_yao=1,
+        goal_progress_pct=parsed_pct,
         context=MingjueContextInfo(
             workspace_root=str(wp.root),
             goal_dir=goal_dir_path,
-            cognition_dirs={{
+            cognition_dirs={
                 "skills": str(wp.skills),
                 "models": str(wp.models),
                 "grids": str(wp.grids),
-            }},
-            memory_dir=str(wp.goals / goal_context.goal_id / "memory"),
+            },
+
             suggested_grids=routing.get("suggested_grids", []),
         ),
     )
@@ -364,7 +389,7 @@ def _fallback_mingjue(goal_context: GoalContext, source: MingjueSource) -> Mingj
                 "models": str(wp.models),
                 "grids": str(wp.grids),
             },
-            memory_dir=str(wp.goals / goal_context.goal_id / "memory"),
+
         ),
     )
 
@@ -390,6 +415,17 @@ def _parse_mingjue_json(text: str) -> dict[str, Any]:
 
     logger.warning("[明觉] 无法解析 JSON，使用默认值")
     return {"trigram": "kun", "summary": "", "concrete_goal": ""}
+
+
+def _parse_progress_pct(raw: Any) -> int:
+    """Parse goal_progress_pct from Mingjue's JSON, returning 0 if absent/invalid."""
+    if raw is None:
+        return 0
+    try:
+        pct = int(raw)
+        return max(0, min(100, pct))
+    except (ValueError, TypeError):
+        return 0
 
 
 # ---------------------------------------------------------------------------

@@ -212,8 +212,9 @@ def ensure_goal_dir(
         return goal_dir
 
     goal_dir.mkdir(parents=True, exist_ok=True)
-    (goal_dir / "memory").mkdir(exist_ok=True)
     (goal_dir / "tasks").mkdir(exist_ok=True)
+    (goal_dir / "deliverables").mkdir(exist_ok=True)
+    (goal_dir / "memory").mkdir(exist_ok=True)
 
     now = datetime.now(timezone.utc).isoformat()
 

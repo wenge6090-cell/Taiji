@@ -13,22 +13,23 @@ The inner loop (Weaver → Yang → Yin → Executor) is delegated to
 from __future__ import annotations
 
 import asyncio
+import json
 from datetime import datetime, timezone
+from pathlib import Path
 
 from loguru import logger
 
-from vingobot.core.goal_context import load_goal_context, refresh_goal_context
-from vingobot.core.goal_meta import update_goal_meta
+from vingobot.core.goal_context import GoalContext, load_goal_context, refresh_goal_context
+from vingobot.core.goal_meta import read_goal_meta, update_goal_meta
 from vingobot.core.manifest import create_manifest, update_manifest_status
-from vingobot.core.trajectory import TrajectoryEntry, append_trajectory_entry
+from vingobot.core.trajectory import update_goal_progress
 from vingobot.core.workspace import create_task_folder, ensure_goal_dir
 from vingobot.goal.anqu import run_anqu
 from vingobot.goal.grid_types import CognitionEvolutionAction
 from vingobot.goal.mingjue import run_mingjue
-from vingobot.goal.task_inner_loop import execute_task_inner_loop
+from vingobot.goal.task_inner_loop import InnerLoopResult, execute_task_inner_loop
 from vingobot.goal.types import (
     AnquAction,
-    AnquDecision,
     GoalResult,
     MingjueOutput,
     MingjueSource,
@@ -76,6 +77,11 @@ async def execute_complete_sixiang_loop(
     task_count = 0
     total_rounds = 0
     consecutive_empty_fallbacks = 0  # track consecutive empty next_task_description
+    consecutive_continuations = 0  # track consecutive goal_next_task decisions
+    goal_progress_history: list[int] = []  # track goal_progress_pct across tasks
+    suggested_trigram = ""  # Anqu's suggested gua for next task
+
+    _REFLECTION_INTERVAL = 3  # force LLM re-assessment every N continuations
 
     while task_count < max_goal_tasks:
         if signal is not None and signal.cancelled():
@@ -97,12 +103,25 @@ async def execute_complete_sixiang_loop(
         if mode == "initial":
             source = MingjueSource(type="initial_goal", description=task_description)
         elif mode == "continuation":
-            source = MingjueSource(
-                type="anqu_continuation",
-                description=task_description,
-                previous_task_summary=previous_task_summary,
-                continuation_context=continuation_context,
-            )
+            # Periodic reflection: force LLM re-assessment every N continuations
+            if consecutive_continuations >= _REFLECTION_INTERVAL:
+                source = MingjueSource(
+                    type="periodic_reflection",
+                    description=task_description,
+                    previous_task_summary=previous_task_summary,
+                    continuation_context=continuation_context,
+                    suggested_trigram=suggested_trigram,
+                )
+                consecutive_continuations = 0
+                goal_progress_history = []  # 同步重置，反射后重新计数
+            else:
+                source = MingjueSource(
+                    type="anqu_continuation",
+                    description=task_description,
+                    previous_task_summary=previous_task_summary,
+                    continuation_context=continuation_context,
+                    suggested_trigram=suggested_trigram,
+                )
         else:
             source = MingjueSource(
                 type="rework",
@@ -115,6 +134,19 @@ async def execute_complete_sixiang_loop(
         # 明觉落地工作环境：注入实际任务目录
         mingjue_output.context.task_dir = str(task_dir)
         previous_mingjue = mingjue_output
+
+        # 保存明觉的进度基线评估
+        mingjue_progress = mingjue_output.goal_progress_pct or 0
+
+        # ── 明觉记忆持久化 ──────────────────────────────────────
+        _persist_memory(goal_id, task_id, "mingjue", {
+            "summary": mingjue_output.summary,
+            "concrete_goal": (mingjue_output.concrete_goal or "")[:300],
+            "trigram": mingjue_output.trigram,
+            "trigram_reason": mingjue_output.trigram_reason,
+            "source_type": source.type,
+            "goal_progress_pct": mingjue_progress,
+        })
 
         # ── 2. 任务内循环 ──────────────────────────────────────
         inner_result = await execute_task_inner_loop(
@@ -141,18 +173,68 @@ async def execute_complete_sixiang_loop(
             task_dir=str(task_dir),
             signal=signal,
             cognitive_usage=inner_result.cognitive_usage,
+            total_tasks=task_count,
+            mingjue_progress_pct=mingjue_progress,
         )
 
-        # Persist trajectory entry
-        _persist_trajectory(
+        # ── 暗驱记忆持久化 ──────────────────────────────────────
+        _persist_memory(goal_id, task_id, "anqu", {
+            "action": anqu_decision.action,
+            "what_was_accomplished": (anqu_decision.task_summary or "")[:300],
+            "next_task_description": (anqu_decision.next_task_description or "")[:200],
+            "goal_progress_pct": anqu_decision.goal_progress_pct,
+            "reason": (anqu_decision.continuation_context or anqu_decision.rework_instruction or "")[:300],
+            "suggested_trigram": anqu_decision.suggested_trigram or "",
+        })
+
+        # ── 总进度写入 ──────────────────────────────────────────
+        _task_status = "completed" if inner_result.task_completed else "failed"
+        if inner_result is not None and inner_result.final_content and "自读循环" in inner_result.final_content:
+            _task_status = "auto_terminated"
+        update_goal_progress(
             goal_id,
-            task_id,
-            anqu_decision,
-            rounds=inner_result.rounds_executed,
+            task_id=task_id,
+            task_status=_task_status,
+            task_summary=(
+                anqu_decision.task_summary
+                or anqu_decision.next_task_description
+                or ""
+            )[:300],
+            round_count=inner_result.rounds_executed,
+            goal_progress_pct=(
+                anqu_decision.goal_progress_pct
+                if anqu_decision.goal_progress_pct is not None
+                else mingjue_progress
+            ),
+            current_assessment=(
+                anqu_decision.task_summary
+                or anqu_decision.continuation_context
+                or ""
+            ),
+            remaining_work=anqu_decision.next_task_description or "",
+            total_tasks=task_count,
+            goal_status=(
+                "completed" if anqu_decision.action == "goal_completed"
+                else "failed" if anqu_decision.action == "goal_failed"
+                else "active"
+            ),
         )
+
+        # ── 任务完成计数 ──────────────────────────────────────
+        try:
+            meta = read_goal_meta(goal_id)
+            if meta is not None:
+                update_goal_meta(goal_id, rounds_completed=meta.rounds_completed + 1)
+        except Exception:
+            pass
 
         # Process cognitive evolution actions (enqueue as learning tasks)
-        _process_evolution_actions(anqu_decision.evolution_actions, task_id)
+        _process_evolution_actions(
+            anqu_decision.evolution_actions,
+            task_id,
+            inner_result=inner_result,
+            task_dir=str(task_dir),
+        )
 
         # ── 4. Route based on Anqu decision ────────────────────
         action: AnquAction = anqu_decision.action
@@ -188,15 +270,44 @@ async def execute_complete_sixiang_loop(
                     )
             else:
                 consecutive_empty_fallbacks = 0  # reset on valid description
+
+            # ── 链深度追踪 ──────────────────────────────────
+            consecutive_continuations += 1
+
+            # ── 滞涨检测: 连续3个任务进度未增长 → 终止 ────
+            pct = anqu_decision.goal_progress_pct if anqu_decision.goal_progress_pct is not None else mingjue_progress
+            if pct is not None:
+                goal_progress_history.append(pct)
+                if len(goal_progress_history) >= 3:
+                    last3 = goal_progress_history[-3:]
+                    if max(last3) - min(last3) <= 5:
+                        update_goal_meta(goal_id, status="completed")
+                        return GoalResult(
+                            status="completed",
+                            goal_id=goal_id,
+                            reason=f"连续 {len(goal_progress_history)} 个任务目标进度停滞 ({last3})，自动终止",
+                        )
+
             task_description = anqu_decision.next_task_description or task_description
             mode = "continuation"
             previous_task_summary = anqu_decision.task_summary or ""
             continuation_context = anqu_decision.continuation_context or ""
+            # ── 注入第一步具体行动 ────────────────────────────
+            if anqu_decision.next_task_concrete_action:
+                continuation_context += (
+                    f"\n\n**下一任务第一步具体行动**: {anqu_decision.next_task_concrete_action}"
+                )
+            # ── 传递卦象建议 ────────────────────────────────
+            suggested_trigram = anqu_decision.suggested_trigram or ""
             goal_context = refresh_goal_context(goal_id)
             continue
 
         if action in ("continue_task", "verify_task", "learn_task"):
             rework_instruction = anqu_decision.rework_instruction or "请重新审题并继续执行"
+            # ── 注入执行诊断信息 ──────────────────────────────
+            diagnostics = _build_rework_diagnostics(inner_result.facts)
+            if diagnostics:
+                rework_instruction += "\n\n" + diagnostics
             mode = "rework"
             continue
 
@@ -216,37 +327,125 @@ async def execute_complete_sixiang_loop(
 # ---------------------------------------------------------------------------
 
 
-def _persist_trajectory(
+def _build_rework_diagnostics(facts: list) -> str:
+    """Build a diagnostic summary from execution facts for rework guidance.
+
+    Analyses what went wrong in the failed task and provides specific,
+    actionable advice for the rework attempt.
+    """
+    from vingobot.goal.types import RoundExecutionFact
+
+    if not facts:
+        return ""
+
+    round_count = len(facts)
+    successes = sum(1 for f in facts if getattr(f, "execution_status", "") == "success")
+    failures = sum(
+        1 for f in facts
+        if getattr(f, "execution_status", "") in ("failure", "partial_failure", "exec_failed")
+    )
+    exec_failures = sum(
+        1 for f in facts
+        if getattr(f, "execution_status", "") == "exec_failed"
+    )
+    read_only_rounds = sum(
+        1 for f in facts
+        if getattr(f, "tool_call_count", 0) > 0
+        and getattr(f, "execution_status", "") in ("success", "skipped")
+    )
+
+    lines: list[str] = ["## 上一轮执行诊断"]
+
+    # ── Exec failure degrade ladder (must precede general patterns) ──
+    if exec_failures >= 2:
+        lines.append(f"检测到连续 {exec_failures} 次 exec 失败（超时或非零退出码）。")
+        lines.append("建议回炉策略：")
+        lines.append("1. **禁止再次执行脚本**——降级为手工产出")
+        lines.append("2. 用 write_file 写入分析报告/简报/文档作为降级交付物")
+        lines.append("3. 如需修复脚本，用 edit_file 修改后用 task_complete 提交")
+        lines.append("4. 禁止用 read_file 读取自己的执行事实文件来\"理解问题\"")
+    elif exec_failures == 1:
+        lines.append(f"检测到 1 次 exec 失败。")
+        lines.append("建议回炉策略：")
+        lines.append("1. 若脚本自身有问题，用 edit_file 修复后重试一次")
+        lines.append("2. 若修复无效，降级为 write_file 手工产出")
+        lines.append("3. **不要**反复读取执行事实文件来\"理解错误\"——直接行动")
+
+    # Pattern detection
+    if round_count >= 12 and failures > 0:
+        lines.append(f"检测到自读循环模式：{round_count}轮中只读{read_only_rounds}轮，{failures}轮失败。")
+        lines.append("建议回炉策略：")
+        lines.append("1. 第一轮直接调用 write_file 产出文件，不要先读")
+        lines.append("2. 仅读取绝对必要的 1-2 个文件后立即产出")
+        lines.append("3. 产出后立即调用 task_complete 结束")
+    elif failures >= 3:
+        lines.append(f"检测到高失败率：{failures}/{round_count} 轮执行失败。")
+        lines.append("建议回炉策略：")
+        lines.append("1. 减少工具调用数量，每次只调用 1 个 write_file")
+        lines.append("2. 先产出最小可行版本，不要追求完美")
+    elif read_only_rounds >= round_count * 0.8:
+        lines.append(f"检测到过度读取：{read_only_rounds}/{round_count} 轮为纯读取操作。")
+        lines.append("建议回炉策略：首轮直接产出文件，跳过探索性读取。")
+    elif round_count >= 20:
+        lines.append(f"检测到轮次过多（{round_count}轮）。")
+        lines.append("建议回炉策略：采用最小可行策略，2-3 轮内产出并结束。")
+    else:
+        lines.append(f"执行概况：{round_count}轮，{successes}成功/{failures}失败。")
+        lines.append("建议回炉策略：聚焦核心产出，减少探索操作。")
+
+    return "\n".join(lines)
+
+
+def _persist_memory(
     goal_id: str,
     task_id: str,
-    decision: AnquDecision,
-    *,
-    rounds: int = 0,
+    entry_type: str,
+    data: dict,
 ) -> None:
-    """Append a trajectory entry for a completed task."""
-    status = "completed" if decision.action in ("goal_completed", "goal_next_task") else "failed"
-    entry = TrajectoryEntry(
-        task_id=task_id,
-        timestamp=datetime.now(timezone.utc).isoformat(),
-        status=status,
-        summary=decision.task_summary or decision.next_task_description or "",
-        round_count=rounds,
-    )
+    """Write a goal-level memory entry (Mingjue or Anqu decision).
+
+    Stored as ``memory/{entry_type}-{task_id}.json`` under the goal directory.
+    Consumed by ``_read_memory_summary`` in the next task's context.
+    """
+    from vingobot.core.workspace import get_goal_dir
+
+    memory_dir = get_goal_dir(goal_id) / "memory"
+    memory_dir.mkdir(parents=True, exist_ok=True)
+
+    entry = {
+        "type": entry_type,
+        "task_id": task_id,
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        **data,
+    }
+
+    path = memory_dir / f"{task_id}__{entry_type}.json"
     try:
-        append_trajectory_entry(goal_id, entry)
-    except Exception:
-        logger.exception("Failed to persist trajectory for goal {}", goal_id)
+        path.write_text(
+            json.dumps(entry, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+        logger.debug("[六爻] 写入{}记忆: {}", entry_type, path)
+    except OSError:
+        logger.warning("[六爻] 写入{}记忆失败: {}", entry_type, path)
 
 
 def _process_evolution_actions(
     actions: list[CognitionEvolutionAction],
     source_task_id: str,
+    *,
+    inner_result: InnerLoopResult | None = None,
+    task_dir: str = "",
 ) -> None:
     """Enqueue cognitive evolution tasks under the special ``cognition-evolution`` goal.
 
     Each ``CognitionEvolutionAction`` is written as a task file to the
     ``.taiji/pending/`` directory, prefixed with priority for ordering.
-    The WorkerPool will pick them up and process them asynchronously.
+    The DMN consumer will pick them up and process them asynchronously.
+
+    When ``inner_result`` and ``task_dir`` are provided, the task description
+    is enriched with execution facts so the DMN LLM can analyze real task
+    data when creating cognitive assets.
     """
     if not actions:
         return
@@ -260,7 +459,11 @@ def _process_evolution_actions(
 
         for action in actions:
             # Build a task description from the evolution action
-            task_desc = _build_evolution_task_description(action)
+            task_desc = _build_evolution_task_description(
+                action,
+                inner_result=inner_result,
+                task_dir=task_dir,
+            )
 
             # Priority-based filename for ordering
             priority_prefix = f"{10 - action.priority:02d}"  # higher priority = earlier
@@ -284,8 +487,78 @@ def _process_evolution_actions(
         logger.warning("[六爻] 处理认知演化动作失败: {}", exc)
 
 
-def _build_evolution_task_description(action: CognitionEvolutionAction) -> str:
-    """Build a human-readable task description from an evolution action."""
+def _resolve_written_path(path: str, task_dir: str) -> str:
+    """Resolve a write_file path to an absolute path for cross-task use.
+
+    Yang may write files with relative paths (e.g. "outputs/report.md").
+    When these paths are injected into the next task's system prompt,
+    they must be absolute so that read_file resolves correctly regardless
+    of the current working directory.
+    """
+    if not path:
+        return ""
+    p = Path(path)
+    if p.is_absolute():
+        return str(p)
+    resolved = (Path(task_dir) / p).resolve()
+    if resolved.is_file():
+        return str(resolved)
+    # Fallback: file may have been written but not yet flushed, return raw
+    return str(resolved)
+
+
+def _scan_task_outputs(task_dir: str) -> list[str]:
+    """Scan a completed task's output files for written deliverables.
+
+    Reads all round JSON files in ``outputs/`` and extracts file paths
+    from successful ``write_file`` calls, deduplicated and sorted.
+    """
+    if not task_dir:
+        return []
+    out_dir = Path(task_dir) / "outputs"
+    if not out_dir.is_dir():
+        return []
+
+    written: set[str] = set()
+    for rf in sorted(out_dir.glob("*-round.json")):
+        try:
+            data = json.loads(rf.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            continue
+
+        # Scan approved_calls + results (exec rounds)
+        approved = data.get("approved_calls") or []
+        results = data.get("results") or []
+        for call, result in zip(approved, results):
+            if call.get("name") == "write_file" and result.get("status") == "success":
+                path = _resolve_written_path(call.get("arguments", {}).get("path", ""), task_dir)
+                if path:
+                    written.add(path)
+
+        # Also scan raw tool_calls (pre-approval, for task_complete rounds)
+        for tc in data.get("tool_calls") or []:
+            if tc.get("name") == "write_file":
+                path = _resolve_written_path(tc.get("arguments", {}).get("path", ""), task_dir)
+                if path:
+                    written.add(path)
+
+    return sorted(written)
+
+
+def _build_evolution_task_description(
+    action: CognitionEvolutionAction,
+    *,
+    inner_result: InnerLoopResult | None = None,
+    task_dir: str = "",
+) -> str:
+    """Build a human-readable task description from an evolution action.
+
+    When ``inner_result`` and ``task_dir`` are provided, the description is
+    enriched with execution facts so the DMN LLM can:
+    - Analyze what the task actually accomplished
+    - Read round-by-round execution data from the task directory
+    - Extract patterns for skills, insight for models, and structure for grids
+    """
     lines = [
         f"# 认知演化任务: {action.action}",
         f"目标: {action.target_name}",
@@ -296,14 +569,70 @@ def _build_evolution_task_description(action: CognitionEvolutionAction) -> str:
         "",
     ]
 
+    # ── Enrich with execution data ──────────────────────────────
+    if task_dir:
+        lines.append(f"## 源任务执行数据")
+        lines.append(f"")
+        lines.append(f"源任务目录: {task_dir}")
+        lines.append(f"执行事实文件: {task_dir}/06-execution-facts.json")
+        lines.append(f"输出文件目录: {task_dir}/outputs/")
+        lines.append(f"清单文件: {task_dir}/manifest.json")
+        lines.append(f"")
+
+        if inner_result is not None:
+            facts = inner_result.facts
+            rounds = inner_result.rounds_executed
+            tool_calls = sum(f.tool_call_count for f in facts)
+            successes = sum(1 for f in facts if f.execution_status == "success")
+            failures = sum(1 for f in facts if f.execution_status in ("failure", "partial_failure", "exec_failed"))
+
+            lines.append(f"- 总轮次: {rounds}")
+            lines.append(f"- 工具调用: {tool_calls} 次")
+            lines.append(f"- 成功轮次: {successes}")
+            lines.append(f"- 失败轮次: {failures}")
+            lines.append(f"")
+
+            # Cognitive usage
+            cu = inner_result.cognitive_usage
+            if cu is not None:
+                if cu.grids_loaded:
+                    lines.append(f"- 已加载的认知格栅: {', '.join(cu.grids_loaded)}")
+                if cu.skills_used:
+                    used_set = [s for s in cu.skills_used if s != "__searched__"]
+                    if used_set:
+                        lines.append(f"- 已使用的技能: {', '.join(used_set)}")
+                if cu.models_loaded:
+                    lines.append(f"- 已加载的思维模型: {', '.join(cu.models_loaded)}")
+                if cu.tools_failed:
+                    lines.append(f"- 调用失败的工具: {', '.join(cu.tools_failed)}")
+                lines.append(f"")
+
+            # Round-by-round summary
+            if facts:
+                lines.append(f"## 执行轮次摘要")
+                lines.append(f"")
+                for f in facts:
+                    status_icon = {"success": "✅", "failure": "❌", "partial_failure": "⚠️", "exec_failed": "🕐", "skipped": "⏭"}.get(f.execution_status, "?")
+                    intent = f.yang_intent_summary[:100]
+                    lines.append(f"- 第{f.round}轮 {status_icon} {f.execution_status}: {intent}")
+                    if f.tool_call_count > 0:
+                        lines.append(f"  工具 {f.tool_call_count} 个 | 审批: {f.yin_decision}")
+                    if f.execution_result_summary:
+                        lines.append(f"  结果: {f.execution_result_summary[:200]}")
+                lines.append(f"")
+    else:
+        lines.append(f"## 说明")
+        lines.append(f"")
+        lines.append(f"无源任务执行数据（可能是手动触发的演化任务）。")
+        lines.append(f"")
+
+    # Extra context from Anqu
     if action.context:
         lines.append("## 上下文")
         import json
 
         lines.append(json.dumps(action.context, ensure_ascii=False, indent=2))
         lines.append("")
-
-    # Action-specific instructions
     if action.action == "learn_skill":
         lines.extend(
             [
@@ -345,6 +674,28 @@ def _build_evolution_task_description(action: CognitionEvolutionAction) -> str:
                 "2. 识别相关的L1技能和L2模型",
                 "3. 创建标准化的L3格栅JSON文件",
                 "4. 更新认知导航索引",
+            ]
+        )
+    elif action.action == "research":
+        lines.extend(
+            [
+                "## 执行说明",
+                "1. 分析目标任务中提出的具体问题或失败模式",
+                "2. 使用 web_search 搜索最佳实践、替代方案或修复方法",
+                "3. 验证搜索到的方案在目标平台（如Windows）的兼容性",
+                "4. 如果找到有效方案，创建或更新对应的L1技能",
+                "5. 更新认知导航索引",
+            ]
+        )
+    elif action.action == "investigate":
+        lines.extend(
+            [
+                "## 执行说明",
+                "1. 读取源任务目录的执行事实文件（06-execution-facts.json）",
+                "2. 分析失败轮次的执行结果和工具调用记录",
+                "3. 识别失败根因模式（工具配置、路径、权限、平台兼容性等）",
+                "4. 根据分析结论创建认知资产（L2模型用于沉淀根因模式，或L3格栅更新）",
+                "5. 更新认知导航索引",
             ]
         )
 

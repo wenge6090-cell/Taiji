@@ -33,9 +33,11 @@ from vingobot.core.goal_context import (
     refresh_goal_context,
 )
 from vingobot.core.trajectory import (
-    TrajectoryEntry,
-    GoalTrajectory,
-    append_trajectory_entry,
+    GoalProgress,
+    TaskProgressEntry,
+    read_goal_progress,
+    update_goal_progress,
+    read_progress_snapshot,
     read_trajectory_snapshot,
 )
 from vingobot.core.tool_base import Schema, Tool, tool_parameters

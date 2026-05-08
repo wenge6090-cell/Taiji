@@ -15,8 +15,8 @@ from typing import Awaitable, Callable
 
 from loguru import logger
 
-from vingobot.core.goal_meta import read_goal_meta, update_goal_meta
-from vingobot.core.pending_queue import PendingQueue
+from vingobot.core.goal_meta import read_goal_meta, scan_active_goals, update_goal_meta
+from vingobot.core.pending_queue import PendingQueue, PendingTask
 
 
 class WorkerPool:
@@ -50,6 +50,8 @@ class WorkerPool:
         self._workers: list[asyncio.Task[None]] = []
         self._active_goals: dict[str, int] = {}  # goal_id → worker_id
         self._stopped = asyncio.Event()
+        self._scanner_task: asyncio.Task[None] | None = None
+        self._scanner_interval = 30  # seconds between self-driven scans
 
     # ------------------------------------------------------------------
     # Properties
@@ -73,6 +75,18 @@ class WorkerPool:
             return
         self._running = True
         self._stopped.clear()
+
+        # ── Recover orphaned .processing files from previous crashes ──
+        try:
+            recovered = PendingQueue.cleanup_orphan_tasks(timeout_ms=0)  # 0 = recover all immediately
+            if recovered > 0:
+                logger.info("[协程池] 启动时恢复 {} 个孤儿任务", recovered)
+        except Exception:
+            logger.warning("[协程池] 孤儿任务清理失败，继续启动")
+
+        # ── Launch self-driven scanner ────────────────────────────
+        self._scanner_task = asyncio.create_task(self._self_driven_scanner())
+
         logger.info("[协程池] 启动 {} 个 worker", self._max_workers)
         for i in range(self._max_workers):
             task = asyncio.create_task(self._worker_loop(i))
@@ -83,10 +97,18 @@ class WorkerPool:
         if not self._running:
             return
         self._running = False
+        # Cancel scanner first
+        if self._scanner_task and not self._scanner_task.done():
+            self._scanner_task.cancel()
         for t in self._workers:
             if not t.done():
                 t.cancel()
         await asyncio.gather(*self._workers, return_exceptions=True)
+        if self._scanner_task:
+            try:
+                await self._scanner_task
+            except asyncio.CancelledError:
+                pass
         self._workers.clear()
         self._active_goals.clear()
         self._stopped.set()
@@ -186,3 +208,87 @@ class WorkerPool:
 
     def get_active_goals(self) -> dict[str, int]:
         return dict(self._active_goals)
+
+    # ------------------------------------------------------------------
+    # Self-driven scanner
+    # ------------------------------------------------------------------
+
+    async def _self_driven_scanner(self) -> None:
+        """Periodically scan self-driven goals and enqueue tasks.
+
+        Wakes every ``_scanner_interval`` seconds, iterates all active
+        goals with ``self_driven.enabled=True``, and enqueues a task when
+        the elapsed time since ``last_active`` exceeds the configured
+        interval.
+        """
+        while self._running:
+            try:
+                await self._scan_and_enqueue_self_driven()
+            except asyncio.CancelledError:
+                break
+            except Exception:
+                logger.exception("[自驱动扫描] 扫描周期异常")
+
+            try:
+                await asyncio.sleep(self._scanner_interval)
+            except asyncio.CancelledError:
+                break
+
+        logger.info("[自驱动扫描] 已退出")
+
+    async def _scan_and_enqueue_self_driven(self) -> None:
+        """One scan cycle: check all self-driven goals."""
+        queue = PendingQueue()
+        now = datetime.now(timezone.utc)
+
+        try:
+            active_goals = scan_active_goals()
+        except Exception:
+            logger.warning("[自驱动扫描] 获取活跃目标失败")
+            return
+
+        for meta in active_goals:
+            sd = meta.self_driven
+            if not sd.enabled:
+                continue
+
+            # Skip if already being processed
+            if meta.id in self._active_goals:
+                continue
+
+            # Skip if there's already a pending task for this goal
+            if any(t.goal_id == meta.id for t in queue.scan_pending()):
+                continue
+
+            # Check elapsed time
+            if meta.last_active:
+                try:
+                    last = datetime.fromisoformat(meta.last_active)
+                    elapsed_min = (now - last).total_seconds() / 60.0
+                except (ValueError, TypeError):
+                    elapsed_min = float("inf")
+            else:
+                elapsed_min = float("inf")  # never active → should trigger
+
+            if elapsed_min < sd.interval_minutes:
+                continue
+
+            # ── Enqueue self-driven task ─────────────────────────
+            task = PendingTask(
+                goal_id=meta.id,
+                description=f"自驱动触发：继续推进目标 '{meta.name or meta.id}'",
+                source="self_driven",
+            )
+            fp = queue.enqueue(task)
+            logger.info(
+                "[自驱动扫描] 入队目标 '{}' (上次活跃: {:.0f}分钟前, 间隔: {}分钟) → {}",
+                meta.id,
+                elapsed_min,
+                sd.interval_minutes,
+                fp,
+            )
+            # Update last_active so we don't re-enqueue on next scan
+            try:
+                update_goal_meta(meta.id, last_active=now.isoformat())
+            except Exception:
+                pass

@@ -326,7 +326,7 @@ class TestResolvePathBoundary:
         from vingobot.core.tool_executor import _resolve_path
 
         outside = tmp_path.parent / "outside.txt"
-        with pytest.raises(ValueError, match="路径超出任务目录"):
+        with pytest.raises(ValueError, match="路径超出允许范围"):
             _resolve_path(str(outside.resolve()), task_dir=tmp_path)
 
     def test_absolute_inside_task_dir_succeeds(self, tmp_path: Path) -> None:

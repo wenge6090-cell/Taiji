@@ -1110,6 +1110,9 @@ class AgentLoop:
                 except asyncio.CancelledError:
                     await self._notify_dmn(f"⏹ 任务已取消: {desc}")
                     logger.info("[DMN] 学习任务被取消")
+                    # Re-raise so the consumer stops (matches 六爻 WorkerPool pattern).
+                    # The ``finally`` block below still runs to clean up the .processing file.
+                    raise
                 except Exception as exc:
                     await self._notify_dmn(f"❌ 任务异常: {desc}\n> {exc}")
                     logger.exception("[DMN] 学习任务异常")
@@ -1170,10 +1173,11 @@ class AgentLoop:
                 "你当前处于全局认知维护模式，身份是系统的认知管家。\n"
                 "职责：\n"
                 "1. **认知演化** — 创建/更新 L1 技能、L2 模型、L3 格栅\n"
-                "2. **全局维护** — 检查 meta.json、归档、暂停、成长日志\n\n"
+                "2. **真理蒸馏** — 从高置信度 L3 格栅中提炼 L4 不可变真理\n"
+                "3. **全局维护** — 检查 meta.json、归档、暂停、成长日志\n\n"
                 "**约束**:\n"
                 "- 所有文件写入必须在 `.taiji/` 目录下\n"
-                "- 不能修改 `.taiji/cognition/truths/` 下的 L4 不可变真理"
+                "- L4 真理只能创建新文件，不能修改已有的真理文件"
             )
 
             # Build system prompt with DMN identity appended
@@ -1206,6 +1210,21 @@ class AgentLoop:
                 raise
             except Exception:
                 logger.exception("[DMN] 任务执行异常")
+
+    @staticmethod
+    def _extract_task_dir(task_description: str) -> str:
+        """Extract the source task directory path from an enriched task description.
+
+        Looks for the ``源任务目录:`` field added by
+        ``_build_evolution_task_description()``.
+
+        Returns the directory path or empty string if not found.
+        """
+        for line in task_description.split("\n"):
+            stripped = line.strip()
+            if stripped.startswith("源任务目录:"):
+                return stripped.replace("源任务目录:", "").strip()
+        return ""
 
     @staticmethod
     def _parse_evolution_task(
@@ -1293,19 +1312,184 @@ class AgentLoop:
         await self._notify_dmn(
             f"📝 正在生成认知资产: {action} → {target_name}\n> {description[:80]}"
         )
-        # Use a focused prompt instructing the LLM to produce the content
-        content_prompt = (
-            f"你正在创建认知资产。请生成以下内容：\n\n"
-            f"动作: {action}\n"
-            f"目标名称: {target_name}\n"
-            f"描述: {description}\n\n"
-            f"原始任务:\n{task_description}\n\n"
-            f"请生成具体的内容定义（不要创建文件，只需输出内容文本）：\n"
-            f"- 如果是 learn_skill 或 precipitate_skill: 输出技能的具体步骤和工具定义\n"
-            f"- 如果是 precipitate_model: 输出经验模型的抽象模式和关键要点\n"
-            f"- 如果是 create_grid: 输出该认知领域的 L1/L2 资产建议列表\n\n"
-            f"请用中文回答，保持简洁。"
+
+        # Parse execution data references from the task description
+        task_dir = _extract_task_dir(task_description)
+        facts_file_hint = (
+            f"\n如需查看更详细的执行记录，可以使用 read_file 读取以下文件：\n"
+            f"- {task_dir}/06-execution-facts.json (每轮详细执行事实)\n"
+            f"- {task_dir}/outputs/ 目录下的文件 (每轮原始输出)\n"
+            if task_dir
+            else ""
         )
+
+        # ── Gather available skills/models for create_grid prompt enrichment ──
+        available_skills: list[str] = []
+        available_models: list[str] = []
+        if action == "create_grid":
+            try:
+                from vingobot.core.workspace import get_workspace_paths
+                wp = get_workspace_paths()
+                if wp.skills.is_dir():
+                    available_skills = sorted(
+                        d.name for d in wp.skills.iterdir() if d.is_dir()
+                    )
+                if wp.models.is_dir():
+                    available_models = sorted(
+                        f.stem for f in wp.models.iterdir()
+                        if f.is_file() and f.suffix in (".md", ".json")
+                    )
+            except Exception:
+                pass
+
+        # Use a focused prompt instructing the LLM to produce the content
+        if action == "create_grid":
+            skills_block = "\n".join(
+                f"  - {s}" for s in available_skills
+            ) if available_skills else "  (无可用技能)"
+            models_block = "\n".join(
+                f"  - {m}" for m in available_models
+            ) if available_models else "  (无可用模型)"
+
+            content_prompt = (
+                f"你正在创建认知资产（L3格栅）。请基于源任务的执行数据分析生成以下内容：\n\n"
+                f"动作: {action}\n"
+                f"目标名称: {target_name}\n"
+                f"描述: {description}\n\n"
+                f"## 原始任务\n{task_description}\n\n"
+                f"{facts_file_hint}"
+                f"## 可用技能（请从中选择，不要自行编造新技能名）\n{skills_block}\n\n"
+                f"## 可用思维模型（请从中选择，不要自行编造新模型名）\n{models_block}\n\n"
+                f"## 八卦映射指引\n"
+                f"根据格栅的领域性质，从以下八卦中选择最匹配的 trigram：\n"
+                f"  - qian(乾): 创造/探索类（如 exploration, creative-thinking）\n"
+                f"  - kun(坤): 承载/积累类（如 accumulation）\n"
+                f"  - zhen(震): 执行/启动类（如 execution, refactor）\n"
+                f"  - xun(巽): 学习/渗透类\n"
+                f"  - kan(坎): 分析/问题解决类（如 analysis, debugging, problem-solving）\n"
+                f"  - li(离): 逻辑/澄清类（如 clarification）\n"
+                f"  - gen(艮): 约束/收敛类（如 constraint）\n"
+                f"  - dui(兑): 输出/文档类（如 communication, documentation）\n\n"
+                f"## 输出要求\n"
+                f"请直接输出一个严格有效的 JSON 对象，不要包含任何解释文字，也不要使用 ```json 代码块标记。"
+                f"JSON 结构如下：\n"
+                f"{{\n"
+                f'  "domain": "{target_name}",\n'
+                f'  "description": "{description}",\n'
+                f'  "trigram": "从上面选择合适的卦象",\n'
+                f'  "proficiency": 0.0,\n'
+                f'  "skills": [\n'
+                f'    {{"name": "技能名", "relevance": "core|frequent|supporting|mandatory"}},\n'
+                f'    ...\n'
+                f'  ],\n'
+                f'  "models": [\n'
+                f'    {{"name": "模型名", "relevance": "core|frequent|supporting|mandatory"}},\n'
+                f'    ...\n'
+                f'  ],\n'
+                f'  "source_models": ["该格栅的来源L2模型名", ...],\n'
+                f'  "emergence_score": 0.0,\n'
+                f'  "workflow": [\n'
+                f'    {{"step": 1, "description": "步骤描述", "skills": ["相关技能名"]}},\n'
+                f'    ...\n'
+                f'  ],\n'
+                f'  "gaps": ["已知不足", ...]\n'
+                f"}}\n\n"
+                f"注意：skills 字段必须从上方「可用技能」列表中选择，不要编造不存在的技能名。"
+            )
+        elif action == "precipitate_truth":
+            # Collect grid names for source_grids reference in prompt
+            grid_names_block = ""
+            try:
+                from vingobot.core.workspace import get_workspace_paths
+                wp = get_workspace_paths()
+                if wp.grids.is_dir():
+                    grid_names = sorted(
+                        f.stem for f in wp.grids.iterdir()
+                        if f.is_file() and f.suffix == ".json" and not f.stem.startswith("太极")
+                    )
+                    if grid_names:
+                        grid_names_block = "\n".join(f"  - {g}" for g in grid_names)
+            except Exception:
+                pass
+
+            content_prompt = (
+                f"你正在创建认知资产（L4真理）。请基于已有的L3格栅提炼底层不变规律：\n\n"
+                f"动作: {action}\n"
+                f"目标名称: {target_name}\n"
+                f"描述: {description}\n\n"
+                f"## 原始任务\n{task_description}\n\n"
+                f"{facts_file_hint}"
+                f"## 可用的L3格栅（请选择 source_grids）\n{grid_names_block or '(无可用格栅)'}\n\n"
+                f"## 输出要求\n"
+                f"请直接输出一个严格有效的 JSON 对象，不要包含任何解释文字或代码块标记。\n"
+                f"JSON 结构如下：\n"
+                f"{{\n"
+                f'  "title": "{description[:80]}",\n'
+                f'  "type": "pattern|identity|safety",\n'
+                f'  "confidence": 0.5,\n'
+                f'  "source_grids": ["来源L3格栅名", ...],\n'
+                f'  "rules": [\n'
+                f'    {{"id": "...", "statement": "..."}},\n'
+                f'    ...\n'
+                f'  ]\n'
+                f"}}\n\n"
+                f"注意：真理应该是不变的底层规律，source_grids 从上方可用格栅中选择。"
+            )
+        elif action == "research":
+            content_prompt = (
+                f"你正在执行一项技术研究任务。请基于源任务的分析需求，使用 web_search "
+                f"工具查找最佳实践、替代方案或修复方法。\n\n"
+                f"动作: {action}\n"
+                f"目标: {target_name}\n"
+                f"描述: {description}\n\n"
+                f"## 原始任务\n{task_description}\n\n"
+                f"{facts_file_hint}"
+                f"## 执行流程\n"
+                f"1. 理解目标任务中提出的问题或失败模式\n"
+                f"2. 使用 **web_search** 搜索相关解决方案、工具用法或替代方案\n"
+                f"3. 使用 **read_file** 读取任务目录中的执行数据（如 06-execution-facts.json）\n"
+                f"4. 综合搜索结果和执行数据分析问题\n"
+                f"5. **输出研究结论**：如果找到有效方案，使用 write_file 将研究结论写入源任务目录，"
+                f"然后总结发现；如果未找到直接方案，输出分析结论和建议\n\n"
+                f"请先使用web_search搜索，理解问题后再输出研究报告。"
+            )
+        elif action == "investigate":
+            content_prompt = (
+                f"你正在执行一项失败分析任务。请使用 read_file 读取源任务的执行事实文件"
+                f"和输出文件，深入分析失败根因。\n\n"
+                f"动作: {action}\n"
+                f"目标: {target_name}\n"
+                f"描述: {description}\n\n"
+                f"## 原始任务\n{task_description}\n\n"
+                f"{facts_file_hint}"
+                f"## 执行流程\n"
+                f"1. 使用 **read_file** 读取源任务目录中的 \n"
+                f"   - 06-execution-facts.json（每轮详细执行事实）\n"
+                f"   - outputs/ 目录下的轮次输出文件\n"
+                f"   - manifest.json（任务清单）\n"
+                f"2. 分析失败轮次的执行结果和工具调用模式\n"
+                f"3. 识别根因（工具配置、路径、权限、平台兼容性等问题）\n"
+                f"4. **输出分析报告**：如果发现明确的根因模式，创建对应的 L2 模型或 L3 格栅更新；"
+                f"否则输出分析结论和改进建议\n\n"
+                f"请先读取任务目录中的执行数据，理解失败模式后再输出分析报告。"
+            )
+        else:
+            content_prompt = (
+                f"你正在创建认知资产。请基于源任务的执行数据分析生成以下内容：\n\n"
+                f"动作: {action}\n"
+                f"目标名称: {target_name}\n"
+                f"描述: {description}\n\n"
+                f"## 原始任务\n{task_description}\n\n"
+                f"{facts_file_hint}"
+                f"请生成具体的内容定义：\n"
+                f"- 如果是 learn_skill 或 precipitate_skill: 分析源任务中的成功SOP，"
+                f"提取可复用的步骤、工具调用模式，输出技能的具体步骤和工具定义。"
+                f"技能名使用 snake_case。\n"
+                f"- 如果是 precipitate_model: 分析源任务中使用的思维方法和决策模式，"
+                f"抽象为通用的L2经验模型，输出模型的抽象模式和关键要点。"
+                f"模型名使用 kebab-case。\n\n"
+                f"请用中文回答，直接输出内容文本，不要创建文件。"
+            )
 
         base_prompt = self.context.build_system_prompt(channel="system")
         system_prompt = (
@@ -1349,28 +1533,66 @@ class AgentLoop:
         if action in ("learn_skill", "precipitate_skill") and llm_content:
             if "description" not in ctx or not ctx["description"]:
                 ctx["description"] = llm_content[:200]
+        if action == "create_grid" and llm_content:
+            # Strip markdown code fences if present, then pass full JSON to parser
+            cleaned = llm_content.strip()
+            if cleaned.startswith("```json"):
+                cleaned = cleaned[7:]
+            if cleaned.startswith("```"):
+                cleaned = cleaned[3:]
+            if cleaned.endswith("```"):
+                cleaned = cleaned[:-3]
+            ctx["llm_analysis"] = cleaned.strip()
+        if action == "precipitate_truth" and llm_content:
+            # Strip fences and parse JSON to extract truth fields
+            cleaned = llm_content.strip()
+            if cleaned.startswith("```json"):
+                cleaned = cleaned[7:]
+            if cleaned.startswith("```"):
+                cleaned = cleaned[3:]
+            if cleaned.endswith("```"):
+                cleaned = cleaned[:-3]
+            try:
+                data = _json.loads(cleaned.strip())
+                if isinstance(data, dict):
+                    ctx["title"] = data.get("title", description[:80])
+                    ctx["type"] = data.get("type", "pattern")
+                    ctx["confidence"] = data.get("confidence", 0.5)
+                    ctx["source_grids"] = data.get("source_grids", [])
+                    ctx["rules"] = data.get("rules", [])
+            except Exception:
+                logger.warning("[DMN] precipitate_truth JSON 解析失败")
+                ctx["title"] = description[:80]
 
         # ── Step 3: Execute structured creation ───────────────────
-        ea = CognitionEvolutionAction(
-            action=action,
-            target_name=target_name,
-            description=description,
-            source_task_id=parsed.get("source_task_id", ""),
-            source_goal_id=parsed.get("source_goal_id", ""),
-            context=ctx,
-        )
-
-        try:
-            created = await cognition_evolver.execute_evolution_action(ea)
-            status = "创建" if created else "已存在(跳过)"
-            logger.info("[DMN] 认知演化结果: {} {} → {}", action, target_name, status)
-            await self._notify_dmn(
-                f"{'✅ 已' + status if created else '⏭ ' + status}: {action} → {target_name}"
+        # research / investigate are self-contained: DMN LLM already used
+        # tools (web_search, read_file, write_file) during _run_agent_loop.
+        if action in ("research", "investigate"):
+            logger.info("[DMN] {} 完成: {} — DMN 已自主处理", action, target_name)
+            emoji = "🔍" if action == "research" else "🔬"
+            await self._notify_dmn(f"{emoji} {action} 完成: {target_name}")
+            # Still refresh caches below
+        else:
+            ea = CognitionEvolutionAction(
+                action=action,
+                target_name=target_name,
+                description=description,
+                source_task_id=parsed.get("source_task_id", ""),
+                source_goal_id=parsed.get("source_goal_id", ""),
+                context=ctx,
             )
-        except Exception:
-            logger.exception("[DMN] 认知演化执行失败: {} {}", action, target_name)
-            await self._notify_dmn(f"❌ 演化失败: {action} → {target_name}")
-            return False
+
+            try:
+                created = await cognition_evolver.execute_evolution_action(ea)
+                status = "创建" if created else "已存在(跳过)"
+                logger.info("[DMN] 认知演化结果: {} {} → {}", action, target_name, status)
+                await self._notify_dmn(
+                    f"{'✅ 已' + status if created else '⏭ ' + status}: {action} → {target_name}"
+                )
+            except Exception:
+                logger.exception("[DMN] 认知演化执行失败: {} {}", action, target_name)
+                await self._notify_dmn(f"❌ 演化失败: {action} → {target_name}")
+                return False
 
         # ── Step 4: Invalidate caches ────────────────────────────
         try:

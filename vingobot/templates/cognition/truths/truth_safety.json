@@ -23,11 +23,19 @@
     },
     {
       "id": "safety-005",
-      "statement": "写入操作必须限制在工作区内。绝对路径指向工作区外的写操作一律拒绝。"
+      "statement": "写入操作（write_file/edit_file/delete_file）必须限制在工作区允许范围内。允许的写入区域包括 task_dir（任务目录）和 goal_dir（目标目录）。绝对路径指向允许范围外的写操作一律拒绝。"
     },
     {
       "id": "safety-006",
       "statement": "不使用 sudo、su 等提权命令执行任何操作。"
+    },
+    {
+      "id": "safety-007",
+      "statement": "edit_file 是写入操作的一种，受与 write_file 完全相同的工作区边界约束。禁止在允许的写入区域外使用 edit_file 修改文件。"
+    },
+    {
+      "id": "safety-008",
+      "statement": "edit_file 不能绕过受保护路径：禁止对 .taiji/cognition/ 下的文件和 config.json 使用 edit_file。"
     }
   ]
 }

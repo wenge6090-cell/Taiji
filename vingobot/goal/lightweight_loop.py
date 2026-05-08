@@ -7,7 +7,7 @@
 
 与完整 task_inner_loop 的区别：
 - 无 L3 格栅发现、无 LLM 策略编织、无八卦路由
-- 仅只读工具 (read_file / list_directory / load_grid / search_skills / ...)
+- 仅只读工具 (read_file / list_directory / ...)
 - 最多 5 轮（vs 30 轮执行）
 - 输出解析自 task_complete 的 JSON
 """
@@ -38,9 +38,6 @@ _ANQU_MAX_ROUNDS = 5
 _LIGHTWEIGHT_TOOLS: list[str] = [
     "read_file",
     "list_directory",
-    "load_grid",
-    "search_skills",
-    "search_models",
     "query_capabilities",
     "task_complete",
 ]
@@ -141,7 +138,7 @@ async def _run_lightweight_core(
     """共享的只读探索-决策循环引擎。
 
     每轮：Yang（LLM）→ 阴（审批）→ 执行器（只读工具）。工具只有
-    read_file / list_directory / load_grid 等纯查询操作，阴直接放行。
+    read_file / list_directory 等纯查询操作，阴直接放行。
     """
 
     task_dir = Path(task_dir)
@@ -151,18 +148,49 @@ async def _run_lightweight_core(
     # ── 构建轻量工具定义 ──────────────────────────────────────
     tool_defs = _build_lightweight_tool_defs()
 
-    # ── 历史记忆（跨轮传递已读内容，避免反复重读）─────────────
+    # ── 历史跟踪 ──────────────────────────────────────────
     previous_invoke_results = ""
+    previous_yang_content = ""  # 跨轮思考延续
+    read_only_round_count = 0  # 连续纯读轮次计数器
+    all_read_paths: set[str] = set()  # 已读文件路径集合
 
     for round_num in range(1, max_rounds + 1):
         if signal is not None and signal.cancelled():
             logger.info("[{}探索] 收到取消信号，第 {} 轮退出", agent_label, round_num)
             break
 
-        # 注入上一轮只读结果到 system prompt
+        # 注入轮次信息和自读检测到 system prompt
         full_prompt = system_prompt
+        full_prompt += f"\n\n## 当前轮次\n第 {round_num}/{max_rounds} 轮"
+
+        # 跨轮思考延续
+        if previous_yang_content:
+            full_prompt += (
+                f"\n\n## 你上一轮的思考\n{previous_yang_content[:2000]}\n\n"
+                "（以上是你上一轮的思考结论。无需重新读取相同文件验证，"
+                "直接基于已有信息做出决策。）"
+            )
+
+        # 注入上一轮只读结果
         if previous_invoke_results:
             full_prompt += f"\n\n## 上一轮查询结果\n{previous_invoke_results[:12000]}"
+
+        # 已读文件提醒
+        if all_read_paths and read_only_round_count >= 1:
+            paths_str = "\n".join(f"- {p}" for p in sorted(all_read_paths))
+            full_prompt += (
+                f"\n\n## 已读文件清单\n以下文件你已经读过：\n{paths_str}\n"
+                "**切勿重复读取以上文件**。直接基于已有信息调用 `task_complete` 提交决策。"
+            )
+
+        # 自读循环警告
+        if read_only_round_count >= 2:
+            full_prompt += (
+                f"\n\n## ⚠️ 自读循环警告\n"
+                f"你已经连续 {read_only_round_count} 轮只读取信息。\n"
+                f"**本轮必须调用 `task_complete` 提交决策**，不得再调用任何只读工具。\n"
+                f"如有足够信息就做决策，信息不足也要做最佳判断——不要在有限轮次中无限读取。"
+            )
 
         # ── 阳 ────────────────────────────────────────────────
         yang_response = await run_yang(
@@ -173,6 +201,9 @@ async def _run_lightweight_core(
             temperature=temperature,
             signal=signal,
         )
+
+        # 保存 Yang 的思考用于跨轮延续
+        previous_yang_content = (yang_response.content or "")[:3000]
 
         if yang_response.called_task_complete:
             logger.info("[{}探索] 第 {} 轮 task_complete，收集到决策", agent_label, round_num)
@@ -207,6 +238,29 @@ async def _run_lightweight_core(
         # 收集本轮只读工具输出，注入下一轮
         previous_invoke_results = _format_prev_results(approved_calls, results)
 
+        # 跟踪已读文件和纯读轮次
+        for call in approved_calls:
+            if call.name == "read_file":
+                path = call.arguments.get("path", "") if call.arguments else ""
+                if path:
+                    all_read_paths.add(path)
+
+        # 检查是否全是只读工具
+        is_read_only_round = all(c.name in _READ_ONLY_TOOLS for c in approved_calls)
+        if is_read_only_round:
+            read_only_round_count += 1
+        else:
+            read_only_round_count = 0
+
+        # 自读循环自动终止：连续 3+ 轮只读
+        if read_only_round_count >= 3:
+            logger.warning("[{}探索] 连续 {} 轮纯读取，自动终止", agent_label, read_only_round_count)
+            return LightweightLoopResult(
+                final_content=None,
+                rounds_executed=round_num,
+                task_completed=False,
+            )
+
     # ── 达到最大轮次，未调用 task_complete ────────────────────
     logger.warning("[{}探索] 达到最大轮次 {}，未收到 task_complete", agent_label, max_rounds)
     return LightweightLoopResult(
@@ -237,8 +291,7 @@ def _build_lightweight_tool_defs() -> list[dict[str, Any]]:
 # ---------------------------------------------------------------------------
 
 _READ_ONLY_TOOLS = frozenset({
-    "read_file", "list_directory", "load_grid",
-    "search_skills", "search_models", "query_capabilities",
+    "read_file", "list_directory", "query_capabilities",
 })
 
 

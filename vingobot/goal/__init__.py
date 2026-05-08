@@ -21,6 +21,7 @@ from vingobot.goal.types import (
     MingjueOutput,
     MingjueSource,
     RoundExecutionFact,
+    SixiangPermissionConfig,
     YangResponse,
 )
 from vingobot.goal.weaver import weave
@@ -37,6 +38,7 @@ __all__ = [
     "AnquDecision",
     "GoalResult",
     "ExecutionResult",
+    "SixiangPermissionConfig",
     "WorkerPool",
     "execute_complete_sixiang_loop",
     "ensure_default_goal",

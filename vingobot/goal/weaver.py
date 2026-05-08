@@ -16,7 +16,8 @@ single round of the inner loop:
 
 L3 Grid integration:
 - ``_discover_skill_tools()`` reads the trigram's grid JSON and loads
-  tool definitions from referenced L1 skills (their ``SKILL.md``).
+  tool definitions from referenced L1 skills (their ``SKILL.md``), plus
+  experience model content from referenced L2 models.
 - Workflow steps from the grid are injected into the system prompt as
   execution guidance.
 """
@@ -34,9 +35,6 @@ from vingobot.goal.grid_types import (
     BaguaGrid,
     LiuyaoGrid,
     SixiangGrid,
-    SixiangMode,
-    TrigramNode,
-    YaoNode,
     parse_bagua_grid,
     parse_liuyao_grid,
     parse_sixiang_grid,
@@ -50,6 +48,22 @@ from vingobot.goal.types import (
 )
 
 # ---------------------------------------------------------------------------
+# Utilities
+# ---------------------------------------------------------------------------
+
+
+def _human_size(size: int) -> str:
+    """Format a byte count into a human-readable string."""
+    if size < 1024:
+        return f"{size} B"
+    for unit in ("KB", "MB", "GB"):
+        size /= 1024.0
+        if size < 1024:
+            return f"{size:.1f} {unit}"
+    return f"{size:.1f} TB"
+
+
+# ---------------------------------------------------------------------------
 # Trigram → tool set mapping (base tools only — skill tools are discovered)
 # ---------------------------------------------------------------------------
 
@@ -58,22 +72,17 @@ _TRIGRAM_TOOLS: dict[str, list[str]] = {
         "read_file",
         "list_directory",
         "write_file",
-        "search_skills",
-        "search_models",
-        "load_grid",
+        "edit_file",
         "web_search",
         "web_fetch",
         "query_capabilities",
         "task_complete",
     ],
-    "kun": ["read_file", "list_directory", "write_file", "exec", "query_capabilities", "task_complete"],
-    "zhen": ["read_file", "list_directory", "write_file", "exec", "query_capabilities", "task_complete"],
+    "kun": ["read_file", "list_directory", "write_file", "edit_file", "exec", "query_capabilities", "task_complete"],
+    "zhen": ["read_file", "list_directory", "write_file", "edit_file", "exec", "query_capabilities", "task_complete"],
     "xun": [
         "read_file",
         "list_directory",
-        "search_skills",
-        "search_models",
-        "load_grid",
         "web_search",
         "query_capabilities",
         "task_complete",
@@ -81,16 +90,13 @@ _TRIGRAM_TOOLS: dict[str, list[str]] = {
     "kan": [
         "read_file",
         "list_directory",
-        "search_skills",
-        "search_models",
-        "load_grid",
         "exec",
         "query_capabilities",
         "task_complete",
     ],
-    "li": ["read_file", "list_directory", "write_file", "search_skills", "query_capabilities", "task_complete"],
-    "gen": ["read_file", "list_directory", "search_skills", "load_grid", "query_capabilities", "task_complete"],
-    "dui": ["read_file", "list_directory", "write_file", "query_capabilities", "task_complete"],
+    "li": ["read_file", "list_directory", "write_file", "edit_file", "query_capabilities", "task_complete"],
+    "gen": ["read_file", "list_directory", "query_capabilities", "task_complete"],
+    "dui": ["read_file", "list_directory", "write_file", "edit_file", "query_capabilities", "task_complete"],
 }
 
 # Base tool definitions (minimal — full definitions fetched from registry at runtime)
@@ -146,6 +152,26 @@ _BASE_TOOL_DEFS: dict[str, dict[str, Any]] = {
             },
         },
     },
+    "edit_file": {
+        "type": "function",
+        "function": {
+            "name": "edit_file",
+            "description": "Edit a file by replacing old_string with new_string. "
+            "Surgical alternative to write_file — read the target file, "
+            "find-and-replace the first occurrence of old_string, and "
+            "write back. Use this for targeted changes instead of "
+            "overwriting the whole file.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string", "description": "File path to edit"},
+                    "old_string": {"type": "string", "description": "Text to replace"},
+                    "new_string": {"type": "string", "description": "Replacement text"},
+                },
+                "required": ["path", "old_string", "new_string"],
+            },
+        },
+    },
     "exec": {
         "type": "function",
         "function": {
@@ -158,48 +184,6 @@ _BASE_TOOL_DEFS: dict[str, dict[str, Any]] = {
                     "cwd": {"type": "string", "description": "Optional working directory"},
                 },
                 "required": ["command"],
-            },
-        },
-    },
-    "search_skills": {
-        "type": "function",
-        "function": {
-            "name": "search_skills",
-            "description": "Search the L1 skill library for relevant reusable skills.",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "query": {"type": "string", "description": "Search query for skills"},
-                },
-                "required": ["query"],
-            },
-        },
-    },
-    "search_models": {
-        "type": "function",
-        "function": {
-            "name": "search_models",
-            "description": "Search the L2 experience model library for relevant patterns.",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "query": {"type": "string", "description": "Search query for models"},
-                },
-                "required": ["query"],
-            },
-        },
-    },
-    "load_grid": {
-        "type": "function",
-        "function": {
-            "name": "load_grid",
-            "description": "Load an L3 cognitive grid by name (e.g. 'exploration', 'debugging').",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "name": {"type": "string", "description": "Cognitive grid name to load"},
-                },
-                "required": ["name"],
             },
         },
     },
@@ -284,18 +268,17 @@ _BASE_TOOL_DEFS: dict[str, dict[str, Any]] = {
 # L3 Grid discovery cache
 # ---------------------------------------------------------------------------
 
-_grid_discovery_cache: dict[str, tuple[list[dict[str, Any]], str]] = {}
+_grid_discovery_cache: dict[str, tuple[list[dict[str, Any]], str, str]] = {}
 
 
-def _discover_skill_tools(trigram: str) -> tuple[list[dict[str, Any]], str]:
-    """Discover L1 skill tools from the trigram's L3 cognitive grid.
+def _discover_skill_tools(trigram: str) -> tuple[list[dict[str, Any]], str, str]:
+    """Discover L1 skill tools + L2 model content from the trigram's L3 grid.
 
     Reads the grid JSON at ``<workspace>/.taiji/cognition/grids/<trigram相关的grid>.json``,
-    resolves referenced skills, and returns their tool definitions + workflow
-    guidance text.
+    resolves referenced skills (tool definitions) and models (formatted content).
 
     Returns:
-        (tool_definitions, workflow_guidance)
+        (tool_definitions, workflow_guidance, model_content)
     """
     # Check cache first (per trigram, per session)
     cached = _grid_discovery_cache.get(trigram)
@@ -304,6 +287,7 @@ def _discover_skill_tools(trigram: str) -> tuple[list[dict[str, Any]], str]:
 
     discovered_tools: list[dict[str, Any]] = []
     workflow_guidance = ""
+    model_content = ""
 
     try:
         from vingobot.core.workspace import get_workspace_paths
@@ -313,7 +297,7 @@ def _discover_skill_tools(trigram: str) -> tuple[list[dict[str, Any]], str]:
         grids_dir = wp.grids
 
         if not grids_dir.is_dir():
-            return [], ""
+            return [], "", ""
 
         # Try to find grid files matching this trigram
         grid_files = list(grids_dir.glob("*.json"))
@@ -329,8 +313,8 @@ def _discover_skill_tools(trigram: str) -> tuple[list[dict[str, Any]], str]:
                 continue
 
         if trigram_grid is None:
-            _grid_discovery_cache[trigram] = ([], "")
-            return [], ""
+            _grid_discovery_cache[trigram] = ([], "", "")
+            return [], "", ""
 
         # Build workflow guidance
         if trigram_grid.workflow:
@@ -353,10 +337,13 @@ def _discover_skill_tools(trigram: str) -> tuple[list[dict[str, Any]], str]:
             tool_defs = _load_skill_tools(skill_name, skill_dir)
             discovered_tools.extend(tool_defs)
 
+        # Load experience model content from grid's model references
+        model_content = _load_grid_models(wp.models, trigram_grid.models)
+
     except Exception as exc:
         logger.warning("[编织] 发现L3格栅技能工具失败: {}", exc)
 
-    result = (discovered_tools, workflow_guidance)
+    result = (discovered_tools, workflow_guidance, model_content)
     _grid_discovery_cache[trigram] = result
     return result
 
@@ -387,6 +374,102 @@ def _load_skill_tools(
     return [t.to_openai_tool_def() for t in meta.tools]
 
 
+def _load_grid_models(models_dir: Path, model_refs: list) -> str:
+    """Load and format L2 experience model files referenced by the grid.
+
+    Reads model files (``.json`` or ``.md``) from
+    ``<workspace>/.taiji/cognition/models/`` and returns a formatted section
+    string for the system prompt.
+
+    Returns:
+        Empty string if no models found or no models directory.
+    """
+    if not model_refs or not models_dir.is_dir():
+        return ""
+
+    entries: list[str] = []
+
+    for ref in model_refs:
+        model_name = ref.name if hasattr(ref, 'name') else str(ref)
+        if not model_name:
+            continue
+
+        # Try .json then .md
+        model_file = None
+        for ext in (".json", ".md"):
+            candidate = models_dir / f"{model_name}{ext}"
+            if candidate.is_file():
+                model_file = candidate
+                break
+
+        if model_file is None:
+            logger.debug("[编织] L3网格引用的模型 '{}' 不存在", model_name)
+            continue
+
+        try:
+            raw = model_file.read_text(encoding="utf-8")
+            if model_file.suffix == ".json":
+                content = _format_json_model(raw, model_name)
+            else:
+                content = raw[:500]
+            entries.append(f"### {model_name}\n{content}")
+        except Exception as exc:
+            logger.debug("[编织] 读取模型 '{}' 失败: {}", model_name, exc)
+
+    if not entries:
+        return ""
+
+    return "## 相关经验模型\n\n" + "\n\n".join(entries)
+
+
+
+def _format_json_model(raw: str, model_name: str) -> str:
+    """Format a JSON model file into readable text for system prompt."""
+    try:
+        data = json.loads(raw)
+    except json.JSONDecodeError:
+        return raw[:500]
+
+    parts: list[str] = []
+    desc = data.get("description", "")
+    if desc:
+        parts.append(f"**描述**: {desc}")
+
+    pattern = data.get("pattern", {})
+    if isinstance(pattern, dict):
+        phases = pattern.get("phases", [])
+        if isinstance(phases, list):
+            parts.append("**模式阶段**:")
+            for phase in phases:
+                if isinstance(phase, dict):
+                    phase_name = phase.get("phase", "")
+                    steps = phase.get("steps", [])
+                    parts.append(f"- **{phase_name}**")
+                    for step in (steps or []):
+                        parts.append(f"  - {step}")
+
+        when_use = pattern.get("when_to_use", [])
+        if isinstance(when_use, list) and when_use:
+            parts.append("**适用场景**:")
+            for item in when_use:
+                parts.append(f"- {item}")
+
+        when_not = pattern.get("when_not_to_use", [])
+        if isinstance(when_not, list) and when_not:
+            parts.append("**不适用场景**:")
+            for item in when_not:
+                parts.append(f"- {item}")
+
+    anti = data.get("anti_patterns", [])
+    if isinstance(anti, list) and anti:
+        parts.append("**反模式**:")
+        for item in anti:
+            parts.append(f"- {item}")
+
+    return "\n".join(parts)
+
+
+
 def clear_grid_discovery_cache() -> None:
     """Clear the L3 grid discovery cache (e.g. after a grid is updated)."""
     _grid_discovery_cache.clear()
@@ -408,7 +491,6 @@ def invalidate_cognition_caches() -> None:
 # ---------------------------------------------------------------------------
 
 _MAX_IDENTICAL_ROUNDS = 4  # trigger warning after this many identical calls
-_MAX_DETAIL_ROUNDS = 10  # early rounds beyond this count get summarised
 
 
 # ---------------------------------------------------------------------------
@@ -422,11 +504,14 @@ async def weave(
     goal_context: Any,
     round_num: int = 1,
     previous_invoke_results: str = "",
-    previous_yang_content: str = "",
     read_only_round_count: int = 0,
     had_successful_write: bool = False,
 ) -> WeaverOutput:
-    """Weave context, tools, and cognitive profile for one round."""
+    """Weave context, tools, and cognitive profile for one round.
+
+    Note: previous_yang_content injection is now handled by task_inner_loop
+    directly before calling run_yang — it is not part of Weaver's responsibility.
+    """
     trigram = mingjue.trigram or "kun"
     tool_names = _TRIGRAM_TOOLS.get(trigram, _TRIGRAM_TOOLS["kun"])
 
@@ -448,31 +533,51 @@ async def weave(
         round_num,
     )
 
-    # 4. Discover L3 grid skill tools
-    skill_tools, workflow_guidance = _discover_skill_tools(trigram)
+    # 4. Discover L3 grid skill tools (model content is now lazy, accessed by Yang)
+    skill_tools, workflow_guidance, _model_content = _discover_skill_tools(trigram)
 
     # 5. Build full system prompt
     system_prompt = _build_system_prompt_v2(
         eternal, mingjue, goal_context, facts, round_num,
         workflow_guidance, previous_invoke_results,
-        previous_yang_content=previous_yang_content,
-        read_only_round_count=read_only_round_count,
-        had_successful_write=had_successful_write,
     )
 
     # 6. Build tool definitions
     tool_defs = [_BASE_TOOL_DEFS[name] for name in tool_names if name in _BASE_TOOL_DEFS]
     tool_defs.extend(skill_tools)
 
-    # 7. LLM strategy weaving (inject CognitiveProfile)
-    strategy_text = await _weave_with_llm(mingjue, facts, round_num, profile)
-    if strategy_text:
-        system_prompt += f"\n\n## 本轮策略\n{strategy_text}"
+    # 7. Inject cognitive posture info (informational, not imperative)
+    yao_keys = ["初爻", "二爻", "三爻", "四爻", "五爻", "上爻"]
+    yao_name = yao_keys[profile.current_yao - 1] if 1 <= profile.current_yao <= 6 else "初爻"
+    system_prompt += (
+        f"\n\n## 本轮认知姿态\n"
+        f"- 爻位: {yao_name}({profile.yao_reasoning})\n"
+        f"- 卦象: {profile.current_gua}卦({profile.gua_reasoning})\n"
+        f"- 四象: {profile.sixiang_selected}({profile.sixiang_reasoning})\n"
+        f"- 参数: T={profile.temperature}, top_p={profile.top_p}, top_k={profile.top_k}, rep_pen={profile.repetition_penalty}\n"
+        f"\n（以上为 Weaver 认知决策引擎的输出，供你参考当前任务阶段的执行姿态，不构成强制指令。）"
+    )
+
+    # 7a. Cognitive asset path guidance (let Yang self-discover)
+    trigram_label = mingjue.trigram or "kun"
+    system_prompt += (
+        f"\n\n## 认知资产指引\n"
+        f"当前卦象 {trigram_label}卦 对应的认知资产可通过以下路径按需访问：\n"
+        f"- L3 网格: 用 `list_directory` 浏览 grids/ 目录，`read_file` 读取匹配 {trigram_label} 卦的 JSON 网格文件获取完整 workflow\n"
+        f"- L2 模型: 用 `list_directory` 浏览 models/ 目录查看可用经验模型，用 `read_file` 读取 .json 或 .md 文件\n"
+        f"- L1 技能: 用 `list_directory` 浏览 skills/ 目录查看可用技能\n"
+        f"遇到特定问题模式时再查阅相关认知资产，不必提前加载全部。"
+    )
 
     # 8. Loop detection
     loop_warning = _detect_loop(facts)
     if loop_warning:
         system_prompt += f"\n\n## ⚠️ 死循环检测\n{loop_warning}"
+
+    # 8a. Termination stats (informational, not imperative)
+    term_directive = _build_termination_directive(round_num, read_only_round_count, had_successful_write)
+    if term_directive:
+        system_prompt += f"\n\n{term_directive}"
 
     # 9. Extract discovered skill names
     grid_skills = []
@@ -494,48 +599,6 @@ async def weave(
     )
 
 
-# ---------------------------------------------------------------------------
-# System prompt builder — three layers + grid workflow
-# ---------------------------------------------------------------------------
-
-
-def _build_system_prompt(
-    mingjue: MingjueOutput,
-    facts: list[RoundExecutionFact],
-    goal_context: Any,
-    round_num: int,
-    workflow_guidance: str = "",
-    previous_invoke_results: str = "",
-) -> str:
-    """Build the (now four-layer) system prompt for Yang.
-
-    Layer order:
-    1. Eternal context — identity, workspace boundaries, execution rules.
-    2. Goal context — blueprint, meta, navigation hints.
-    3. invoke 结果 — previous round's read-only outputs.
-    4. Round facts — accumulated execution history.
-    """
-
-    # Layer 1: Eternal context (philosophical grounding)
-    l1 = _layer_eternal(mingjue)
-
-    # Layer 2: Goal context
-    l2 = _layer_goal_context(mingjue, goal_context, workflow_guidance)
-
-    # Layer 3: Previous invoke results — bridge between rounds
-    if previous_invoke_results:
-        l3 = f"## 上一轮只读查询结果\n{previous_invoke_results[:15000]}"
-    else:
-        l3 = ""
-
-    # Layer 4: Round facts (accumulated execution history)
-    l4 = _layer_round_facts(facts, round_num)
-
-    parts = [l1, l2, l4]
-    if l3:
-        parts.insert(2, l3)  # inject between goal context and round facts
-    return "\n\n---\n\n".join(p for p in parts if p)
-
 
 def _build_system_prompt_v2(
     eternal: str,
@@ -545,11 +608,13 @@ def _build_system_prompt_v2(
     round_num: int,
     workflow_guidance: str = "",
     previous_invoke_results: str = "",
-    previous_yang_content: str = "",
-    read_only_round_count: int = 0,
-    had_successful_write: bool = False,
 ) -> str:
-    """Build the system prompt from pre-computed eternal context."""
+    """Build the system prompt from pre-computed eternal context.
+
+    Note: Yang-side injections (previous_yang_content, terminate directives,
+    invoke results window, execution history path reference) are now handled
+    by task_inner_loop, not by Weaver.
+    """
     parts = [eternal]
     l2 = _layer_goal_context(mingjue, goal_context, workflow_guidance)
     if l2:
@@ -559,87 +624,62 @@ def _build_system_prompt_v2(
     l4 = _layer_round_facts(facts, round_num)
     if l4:
         parts.append(l4)
-    # Inject Yang's previous thinking for cross-round continuity
-    if previous_yang_content:
+
+    # ── Exec failure recovery guidance ───────────────────────
+    exec_failures = sum(
+        1 for f in facts
+        if getattr(f, "execution_status", "") == "exec_failed"
+    )
+    if exec_failures >= 2:
         parts.append(
-            "## 你上一轮的思考\n"
-            + (previous_yang_content or "")[:3000]
-            + "\n\n"
-            "（以上是你上一轮的思考结论。无需重新读取相同文件验证，"
-            "直接基于已有信息推进任务。）"
+            f"## ⚠️ exec 连续失败 ({exec_failures} 次)\n"
+            f"检测到连续 exec 失败（超时或非零退出码）。"
+            f"**禁止再次执行同一脚本！**\n"
+            f"降级方案：用 write_file 写入手工分析报告/文档作为替代交付物。\n"
+            f"如需修复脚本，用 edit_file 一次性修复后用 task_complete 提交结果。\n"
+            f"**不要**用 read_file 读取自己的执行事实文件来试图\"理解错误\"——直接行动。"
         )
-    directive = _build_termination_directive(round_num, read_only_round_count, had_successful_write)
-    if directive:
-        parts.append(directive)
+    elif exec_failures == 1:
+        parts.append(
+            f"## ⚠️ exec 执行失败\n"
+            f"上一轮 exec 执行失败。\n"
+            f"1. 若脚本有 bug，用 edit_file 修复后重试一次\n"
+            f"2. 若无法修复，降级为 write_file 手工产出\n"
+            f"3. 禁止反复读取执行事实文件——直接行动，不要观察。"
+        )
+
+    # ── Failable operation enforcement ─────────────────────────
+    _FAILABLE_THRESHOLD = 3
+    non_failable_streak = 0
+    for f in reversed(facts):
+        if not getattr(f, "had_failable_op", False):
+            non_failable_streak += 1
+        else:
+            break
+    if non_failable_streak >= _FAILABLE_THRESHOLD:
+        if exec_failures >= 2:
+            action_items = (
+                f"1. 用 write_file 写入产出，然后立刻 read_file 验证内容正确\n"
+                f"2. 用 web_search 获取外部信息（多源交叉验证）\n"
+            )
+        else:
+            action_items = (
+                f"1. 用 write_file 写入产出，然后立刻 read_file 验证内容正确\n"
+                f"2. 用 exec 执行脚本，观察真实运行结果而非继续阅读\n"
+                f"3. 用 web_search 获取外部信息（多源交叉验证）\n"
+            )
+        parts.append(
+            f"## ⚠️ 连续 {non_failable_streak} 轮无验证性操作\n"
+            f"你已连续 {non_failable_streak} 轮只做 read_file/list_directory，"
+            f"未执行任何**可失败操作**（exec / web_search / web_fetch / write_file / edit_file）。\n\n"
+            f"**本轮强制要求**：必须执行以下至少一项之后才能继续读取文件：\n"
+            f"{action_items}\n"
+            f"**禁止**继续读自己的执行事实文件或已读过的产出文件——你已经有足够信息，"
+            f"现在需要行动起来，用不可预知的真实结果来校准你的理解。"
+        )
+
     return "\n\n---\n\n".join(p for p in parts if p)
 
-
-def _layer_eternal(mingjue: MingjueOutput) -> str:
-    """Layer 1: Minimal identity + workspace boundaries for Yang."""
-    parts: list[str] = []
-    parts.append("你是一个自主AI智能体，以六爻循环的方式推进目标任务。")
-    parts.append("你是三爻·阳，保持空性——不预判、不预设，基于当前轮次的事实信息做出判断。")
-    parts.append("你的唯一使命：推动当前任务走向完成。")
-
-    ctx = mingjue.context
-    if ctx and ctx.task_dir:
-        parts.append("")
-        parts.append("## 工作区")
-        parts.append(f"当前任务目录: {ctx.task_dir}")
-
-        # Derive project root for boundary hints
-        try:
-            task_p = Path(ctx.task_dir)
-            ws_dir = task_p
-            for _ in range(10):
-                if (ws_dir / ".vingobot").is_dir():
-                    break
-                ws_dir = ws_dir.parent
-            project_root = str(ws_dir.resolve())
-        except Exception:
-            project_root = ""
-
-        parts.append("")
-        parts.append("### 安全边界")
-        parts.append(f"- **可读范围**: 项目根目录 `{project_root}` 及子目录内的所有文件（read_file/list_directory/exec 只读命令）")
-        parts.append(f"- **写入限制**: write_file 仅允许在 `{ctx.task_dir}` 目录及其 outputs/ 子目录")
-        parts.append("- **保护路径**: `.vingobot/.taiji/cognition/truths/` 目录及其内容受 L4 安全真理层保护，**禁止写入**")
-        parts.append("- **禁止操作**: 不得尝试写入、删除或修改认知库文件 (skills/models/grids/truths)")
-        parts.append("- **路径绝对化**: 使用绝对路径，不要使用相对路径（会被阴层拦截）")
-        parts.append("")
-
-        if ctx.goal_dir:
-            parts.append(f"目标目录（可读）: {ctx.goal_dir}")
-        if ctx.memory_dir:
-            parts.append(f"目标记忆（可读）: {ctx.memory_dir}")
-
-        if ctx.cognition_dirs:
-            parts.append("认知库（可读）:")
-            for kind, dir_path in ctx.cognition_dirs.items():
-                parts.append(f"  {kind}: {dir_path}")
-            parts.append("使用 load_grid / search_skills / search_models 按需读取认知库，也可用 read_file 直接读取。")
-
-        parts.append("如需执行命令，请确保命令的工作目录在当前任务目录下。")
-
-        # ── 效率提示 ───────────────────────────────────────────
-        parts.append("")
-        parts.append("## 效率提示")
-        parts.append("你拥有 1M tokens 上下文窗口，无需过于保守。以下机制可大幅提升效率：")
-        parts.append("")
-        parts.append("1. **并发工具调用**：一轮最多同时调用 10 个工具，所有调用并发执行。")
-        parts.append("   需要读取多个文件？一次性发送多个 read_file 调用，不要逐个串行。")
-        parts.append("")
-        parts.append("2. **跨轮信息传递**：上一轮的 read_file / list_directory / load_grid / search_skills 等")
-        parts.append("   只读工具的返回结果会自动注入到下一轮的系统提示中，你无需反复重读相同内容。")
-        parts.append("")
-        parts.append("3. **广泛读权限**：除了当前任务目录，你还可以只读访问目标目录和认知库")
-        parts.append("   (skills / models / grids) 中的文件。先用 list_directory 摸清目录结构，")
-        parts.append("   再用 read_file 批量读取关键文件。")
-        parts.append("")
-        parts.append("4. **不确定能力边界？** 调用 query_capabilities 工具获取当前执行环境的")
-        parts.append("   能力配额（并发数、读写权限、上下文预算等）。")
-
-    return "\n".join(parts)
 
 
 def _layer_goal_context(
@@ -726,57 +766,71 @@ def _layer_goal_context(
                     parts.append(f"\n## 阶段报告\n{p1_text}")
                 except OSError:
                     pass
+
+            # ── Goal deliverables directory ─────────────────────────
+            dlv_dir = gd / "deliverables"
+            if dlv_dir.is_dir():
+                dlv_files = sorted(dlv_dir.iterdir())
+                if dlv_files:
+                    dlv_lines = [
+                        "\n## 目标共享产出（可跨任务复用）",
+                        "以下文件位于 `deliverables/` 目录，由前序任务写入，",
+                        "供当前及后续任务直接复用。你应该优先 read_file 此目录下的文件。",
+                        "",
+                    ]
+                    for df in dlv_files:
+                        try:
+                            ds = df.stat().st_size
+                            dlv_lines.append(f"- `{df}` ({_human_size(ds)}, {df.suffix or '无后缀'})")
+                        except OSError:
+                            dlv_lines.append(f"- `{df}`")
+                    parts.append("\n".join(dlv_lines))
+                # Always inject guidance on where to write reusable outputs
+                parts.append(
+                    "\n## 产出文件写入规范\n"
+                    "可跨任务复用的产出（分析报告、代码、数据集、设计文档等）应写入 "
+                    f"`{dlv_dir.resolve()}` 目录。仅轮次级的执行日志/反思写入 "
+                    "当前任务目录下的 `outputs/`。这样后续任务可以直接复用你的成果，"
+                    "无需从零开始。"
+                )
         except Exception:
             pass
 
-    # Cognitive navigation — tools only, no content
+    # Cognitive navigation — direct file reading, no tool wrappers
     ctx = mingjue.context
     if ctx and ctx.suggested_grids:
         grids_str = ", ".join(ctx.suggested_grids)
         parts.append(f"\n## 认知导航\n建议加载的认知网格: {grids_str}")
-        parts.append("使用 `load_grid` 工具按需加载认知网格内容。")
-        parts.append("使用 `search_skills` 搜索可复用的技能。")
-        parts.append("使用 `search_models` 搜索经验模型。")
+        parts.append("用 list_directory 浏览 grids/ 目录，用 read_file 读取网格 JSON 文件。")
+        parts.append("如需搜索技能/模型，用 list_directory 浏览 skills/ 和 models/ 目录，再 read_file 读取匹配文件。")
 
-    # L3 grid workflow guidance (if discovered)
+    # L3 grid workflow guidance (path reference — Yang reads grid JSON for full workflow)
     if workflow_guidance:
-        parts.append(workflow_guidance)
-
-    parts.append("\n## 工具使用原则")
-    parts.append("- 按需调用工具，一次不要超过 3 个。")
-    parts.append("- 完成任务后调用 `task_complete` 并给出总结。")
-    parts.append("- 每个工具调用都有成本的，请谨慎使用。")
+        parts.append(f"\n## 网格工作流摘要\n当前领域网格包含推荐工作流，完整步骤请用 `read_file` 读取网格 JSON 文件。\n摘要：\n{workflow_guidance[:500]}")
 
     return "\n".join(parts)
 
 
 def _layer_round_facts(facts: list[RoundExecutionFact], round_num: int) -> str:
-    """Layer 3: Accumulated round execution facts with layered summarization.
+    """Layer 3: Accumulated round execution facts.
 
-    Early rounds (beyond ``_MAX_DETAIL_ROUNDS``) are condensed into a
-    one-line statistical summary to save prompt space; recent rounds are
-    displayed in full detail for fine-grained context.
+    Shows last 10 rounds in full detail, and provides a path reference
+    to the complete ``06-execution-facts.json`` file for earlier rounds.
+    Yang can use ``read_file`` to access any round's full data on demand.
     """
     if not facts:
         return f"## 当前轮次: {round_num}\n\n这是第一轮，请开始执行任务。"
 
     lines = [f"## 执行历史 (当前轮次: {round_num})\n"]
+    lines.append(f"完整执行事实文件: 06-execution-facts.json（包含所有 {len(facts)} 轮的完整数据）\n")
 
-    if len(facts) <= _MAX_DETAIL_ROUNDS:
-        # ── All rounds in full detail ──────────────────────
-        for f in facts:
-            lines.append(_format_single_fact(f))
-    else:
-        # ── Early rounds → statistical summary ─────────────
-        earlier = facts[:-_MAX_DETAIL_ROUNDS]
-        summary = _summarize_earlier_rounds(earlier)
-        if summary:
-            lines.append(summary)
+    # Always show last 10 in detail
+    recent = facts[-min(len(facts), 10):]
+    for f in recent:
+        lines.append(_format_single_fact(f))
 
-        # ── Recent rounds → full detail ────────────────────
-        recent = facts[-_MAX_DETAIL_ROUNDS:]
-        for f in recent:
-            lines.append(_format_single_fact(f))
+    if len(facts) > 10:
+        lines.append(f"\n（前 {len(facts) - 10} 轮详情请通过 read_file 读取 06-execution-facts.json）")
 
     return "\n".join(lines)
 
@@ -794,40 +848,6 @@ def _format_single_fact(f: RoundExecutionFact) -> str:
         f"- {yin_str}\n"
         f"- 执行: {f.execution_status} — {f.execution_result_summary}\n"
     )
-
-
-def _summarize_earlier_rounds(earlier: list[RoundExecutionFact]) -> str:
-    """Condense a list of earlier rounds into a one-line statistical summary."""
-    if not earlier:
-        return ""
-
-    total = len(earlier)
-    success_count = sum(1 for f in earlier if f.execution_status == "success")
-    failure_count = sum(1 for f in earlier if f.execution_status in ("failure", "partial_failure"))
-    skipped_count = sum(1 for f in earlier if f.execution_status == "skipped")
-    action_rounds = sum(1 for f in earlier if f.had_action_request)
-    rejected_count = sum(1 for f in earlier if f.yin_decision == "rejected")
-
-    first_round = earlier[0].round
-    last_round = earlier[-1].round
-    range_label = (
-        f"第{first_round}轮" if first_round == last_round else f"第{first_round}-{last_round}轮"
-    )
-
-    parts = [f"（{range_label}概述：共 {total} 轮"]
-    if action_rounds > 0:
-        parts.append(f"，{action_rounds} 轮有工具调用")
-    if success_count > 0:
-        parts.append(f"，{success_count} 次执行成功")
-    if failure_count > 0:
-        parts.append(f"，{failure_count} 次执行失败")
-    if rejected_count > 0:
-        parts.append(f"，{rejected_count} 次被阴拒绝")
-    if skipped_count > 0:
-        parts.append(f"，{skipped_count} 轮纯思考")
-    parts.append("）")
-
-    return "".join(parts)
 
 
 # ---------------------------------------------------------------------------
@@ -854,8 +874,8 @@ def _detect_loop(facts: list[RoundExecutionFact]) -> str | None:
 
     if len(set(hashes)) <= 2:  # Very similar intents
         return (
-            f"检测到最近 {_MAX_IDENTICAL_ROUNDS} 轮出现高度相似的思考模式。"
-            "请尝试不同的方法，或者加载新的认知网格来打破循环。"
+            f"检测到最近 {_MAX_IDENTICAL_ROUNDS} 轮出现高度相似的思考模式。\n"
+            "建议：尝试不同的方法，或加载新的认知网格来打破循环。"
         )
 
     # Pattern 2: Alternating success/failure cycle (stuck pattern)
@@ -877,86 +897,6 @@ def _detect_loop(facts: list[RoundExecutionFact]) -> str | None:
                 "请停止这种循环。你需要的信息可能位于 目标目录 中（参考上面的目标目录文件清单），"
                 "而不是当前任务目录。使用 read_file 读取目标目录中的实际文件（如 blueprint.md 等）来获取所需信息。"
             )
-
-    return None
-
-
-# ---------------------------------------------------------------------------
-# LLM strategy weaving
-# ---------------------------------------------------------------------------
-
-
-async def _weave_with_llm(
-    mingjue: MingjueOutput,
-    facts: list[RoundExecutionFact],
-    round_num: int,
-    profile: CognitiveProfile,
-) -> str | None:
-    """Call the LLM to generate a brief strategy text for this round.
-
-    Produces 80-200 character Chinese strategy text that tells Yang
-    what to focus on.  Returns ``None`` to fall back to the template
-    strategy (no LLM available or generation failed).
-
-    Injects the cognitive profile info so the strategy text is coherent
-    with the cognitive posture for this round.
-    """
-    provider = _get_provider()
-    if provider is None:
-        return None
-
-    trigram = mingjue.trigram or "kun"
-
-    # Build cognitive posture summary
-    yao_keys = ["初爻", "二爻", "三爻", "四爻", "五爻", "上爻"]
-    yao_name = yao_keys[profile.current_yao - 1] if 1 <= profile.current_yao <= 6 else "初爻"
-
-    posture_text = (
-        f"当前认知姿态: {yao_name} | {profile.current_gua}卦 | {profile.sixiang_selected}\n"
-        f"爻位理由: {profile.yao_reasoning}\n"
-        f"四象理由: {profile.sixiang_reasoning}\n"
-        f"卦象理由: {profile.gua_reasoning}"
-    )
-
-    system_prompt = (
-        "你是二爻·编织器，为阳 Agent 生成本轮的策略部分。"
-        "你的输出会拼接到阳的完整 system prompt 中。\n\n"
-        f"八卦卦象: {trigram}\n\n"
-        f"## 认知姿态\n{posture_text}\n\n"
-        "请生成一段简短的中文策略（80-200字），告诉阳：\n"
-        "1. 本轮的核心目标是什么（一句话）\n"
-        "2. 最小可行的具体行动是什么（读取？写入？执行？）\n"
-        "3. 上一轮进度的延续方式（如果有执行历史）\n"
-        "4. 有什么需要避免的陷阱\n\n"
-        "**重要**：\n"
-        "- 直接输出策略文本，不要前缀，不要JSON，不要markdown\n"
-        "- 控制在80-200字之间"
-    )
-
-    # Build user prompt
-    user_prompt = f"当前任务: {mingjue.concrete_goal or mingjue.summary}"
-    if facts:
-        recent = facts[-3:]
-        user_prompt += "\n\n执行历史（最近轮次）:"
-        for f in recent:
-            user_prompt += (
-                f"\n  第{f.round}轮: {f.yang_intent_summary[:80]}"
-                f" → 审批: {f.yin_decision}"
-                f" → 执行: {f.execution_status}"
-            )
-
-    try:
-        response = await provider.chat_with_retry(
-            messages=[
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": user_prompt},
-            ],
-        )
-        content = (response.content or "").strip()
-        if content and 30 < len(content) < 500:
-            return content
-    except Exception:
-        logger.debug("[编织] LLM 策略编织失败，使用模板")
 
     return None
 
@@ -1345,119 +1285,51 @@ def set_provider(provider: Any) -> None:
 # Termination directives and round limit constants
 # ---------------------------------------------------------------------------
 
-_ENTIRE_READ_THRESHOLD = 3
-"""连续N轮纯读取即注入警示。"""
-
-
 _TERMINATION_MAX_ROUNDS = 30
 """默认最大轮次（与 task_inner_loop 保持一致）。"""
 
-
-_TERMINATION_FORCE_CEILING = _TERMINATION_MAX_ROUNDS - 5
-"""超过此轮次强制要求 task_complete。"""
-
-
-_TERMINATION_CRITICAL_CEILING = _TERMINATION_MAX_ROUNDS - 3
-"""超过此轮次注入极其强硬的终止指令。"""
-
-
-_TERMINATION_EARLY_COUNT = 4
-"""纯读轮次达到此值，注入早期警示。"""
-
-_ENFORCE_WRITE_COUNT = 3
-"""连续纯读轮次达到此值，注入强制写入指令。"""
-
 _TERMINATION_WARN_COUNT = 6
-"""纯读轮次达到此值，注入警告。"""
-
-
-_TERMINATION_CRITICAL_COUNT = 8
-"""纯读轮次达到此值，注入强制终止指令。"""
-
+"""纯读轮次达到此值，在统计信息中显示警告。"""
 
 _TERMINATION_AUTO_FLOOR = 5
 """任务内循环自动终止的纯读轮次下限。需与 task_inner_loop._AUTO_TERMINATE_FLOOR 同步。"""
 
-
 _TERMINATION_AUTO_THRESHOLD = 12
 """超过此轮次+纯读轮次超过下限时自动终止。需与 task_inner_loop._AUTO_TERMINATE_THRESHOLD 同步。"""
-
 
 _DEFAULT_MAX_ROUNDS = _TERMINATION_MAX_ROUNDS
 """导出给 task_inner_loop 使用。"""
 
 
 def _build_termination_directive(round_num: int, read_only_round_count: int, had_successful_write: bool = False) -> str:
-    """Build a round-termination directive based on execution patterns.
+    """Build a termination STATS block (informational, not imperative).
 
-    Injects increasingly forceful instructions into the system prompt as
-    the read-only loop deepens, guiding Yang to either call task_complete
-    or switch to write/exec tools.
+    Yang receives execution statistics and decides autonomously when to
+    call task_complete — the framework no longer issues imperative
+    "you must" directives.
     """
     lines: list[str] = []
+    lines.append("## 执行统计")
 
-    # ── Round-based urgency ────────────────────────────────────
-    if round_num >= _TERMINATION_CRITICAL_CEILING:
-        lines.append(
-            "## 强制提示: 即将达到轮次上限\n"
-            "本轮结束后系统将自动终止。请立即调用 `task_complete` "
-            "提交你已经完成的所有工作。如果有未完成的成果，先写文件再结束。"
-        )
-    elif round_num >= _TERMINATION_FORCE_CEILING:
-        remaining = _TERMINATION_MAX_ROUNDS - round_num
-        lines.append(
-            "## 剩余轮次警告\n"
-            f"你还剩 {remaining} 轮。请加速推进，尽快调用 `task_complete` 完成本任务。"
-        )
+    # Round budget
+    remaining = _TERMINATION_MAX_ROUNDS - round_num
+    lines.append(f"- 已用轮次: {round_num}/{_TERMINATION_MAX_ROUNDS}（剩余 {remaining} 轮）")
 
-    # ── Force completion check after successful write ──────────
+    # Read-only counter
+    if read_only_round_count > 0:
+        lines.append(f"- 连续纯读取: {read_only_round_count} 轮")
+        if read_only_round_count >= _TERMINATION_WARN_COUNT:
+            lines.append(
+                f"  （连续纯读取已达 {read_only_round_count} 轮，"
+                f"系统将在第 {_TERMINATION_AUTO_THRESHOLD} 轮触发自动终止）"
+            )
+
+    # Write status
     if had_successful_write:
-        lines.append(
-            "## 上轮执行成功 — 强制完成判定\n"
-            "上一轮你已成功通过 `write_file` 或 `exec` 写入/执行了成果。\n"
-            "你必须立即对照任务目标，逐项检查所有交付物是否已创建且内容正确。\n"
-            "如果已全部达成 → **本轮必须调用 `task_complete` 结束任务**，不得再执行任何操作。\n"
-            "如果有遗漏 → 本轮使用 `write_file` 补充写入。不得反复读取已成功写入的文件做'验证'。\n"
-            "**警告：read_file/list_directory 是只读工具会即时执行，无需再次验证。确认后立即 task_complete。**"
-        )
+        lines.append("- 上轮: 成功写入/执行了交付物")
+        lines.append("  （如果任务目标已全部达成，可调用 task_complete）")
 
-    # ── No-action enforcement: push from read-only to writing ──
-    if read_only_round_count >= _ENFORCE_WRITE_COUNT:
-        lines.append(
-            f"## ⚠️ 必须写入成果\n"
-            f"你已经连续 {read_only_round_count} 轮只读取信息，尚未产生任何交付物。\n"
-            "**本轮你必须使用 `write_file` 写入成果文件**，不得继续仅做读操作。\n"
-            "任务若要完成，必须将收集到的信息通过 `write_file` 写成文件。\n"
-            "你上一轮的思考和已读内容都已注入到本轮的上下文中——不要重新读取。"
-        )
+    # File count
+    lines.append("- 已产生交付物: 见任务目录下的 outputs/ 子目录")
 
-    # ── Read-only loop detection ───────────────────────────────
-    if read_only_round_count >= _TERMINATION_CRITICAL_COUNT:
-        remaining = _TERMINATION_AUTO_THRESHOLD - round_num
-        if remaining < 0:
-            remaining = 0
-        lines.append(
-            f"## ⛔ 自读循环强制终止警告\n"
-            f"你已经连续 {read_only_round_count} 轮只读取信息，系统已检测到自读循环。\n"
-            f"**再执行 {remaining} 轮将触发系统强制终止**，任务将被关闭且不计为完成。\n"
-            "立即执行以下操作之一：\n"
-            "1. 如果你已经收集了足够信息，立即调用 `task_complete` 结束本任务。\n"
-            "2. 如果你还有工作需要推进，立即使用 `write_file` 写入成果文件。\n"
-            "3. **绝不能再调用 `read_file` 或 `list_directory`**——你读过的内容已通过跨轮注入存在于上下文中。"
-        )
-    elif read_only_round_count >= _TERMINATION_WARN_COUNT:
-        lines.append(
-            f"## 执行效率警告\n"
-            f"你已经连续 {read_only_round_count} 轮只读取信息。请立即切换行动：\n"
-            "- 使用 `write_file` 写入成果文件\n"
-            "- 使用 `exec` 执行命令\n"
-            "- 如果无需更多操作，调用 `task_complete` 结束"
-        )
-    elif read_only_round_count >= _TERMINATION_EARLY_COUNT:
-        lines.append(
-            f"## 效率提示\n"
-            f"注意：你已经连续 {read_only_round_count} 轮只有读取操作。"
-            "如果信息已经足够，请直接推进执行或调用 `task_complete`。"
-        )
-
-    return "\n\n---\n\n".join(lines) if lines else ""
+    return "\n".join(lines)

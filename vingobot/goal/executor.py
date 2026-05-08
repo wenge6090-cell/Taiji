@@ -29,6 +29,7 @@ from vingobot.core.tool_executor import (
     execute_builtin_tool,
 )
 from vingobot.goal.types import ApprovedToolCall, ExecutionResult
+from vingobot.goal.types import SixiangPermissionConfig
 from vingobot.goal.yin import _check_path_safety as _yin_check_path_safety
 from vingobot.goal.yin import _check_exec_safety as _yin_check_exec_safety
 
@@ -69,15 +70,19 @@ async def execute_tool_calls(
     task_dir: str | Path | None = None,
     goal_dir: str | Path | None = None,
     cognition_dirs: list[str | Path] | None = None,
+    perm: SixiangPermissionConfig | None = None,
 ) -> list[ExecutionResult]:
     """Execute a batch of approved tool calls.
 
     Args:
         calls: Approved calls from Yin.
         task_dir: Optional task directory for path resolution context.
-        goal_dir: Optional goal directory for read-only path resolution.
+        goal_dir: Optional goal directory for read/write/exec path resolution.
         cognition_dirs: Optional cognition directories (skills, models, grids)
             for read-only path resolution.
+        perm: Unified permission config.  When provided, ``task_dir`` / ``goal_dir``
+            / ``cognition_dirs`` are derived from it and individual params
+            are ignored.
 
     Returns:
         List of ``ExecutionResult``, one per call.
@@ -97,7 +102,10 @@ async def execute_tool_calls(
 
     async def _guarded(c: ApprovedToolCall) -> ExecutionResult:
         async with gate:
-            return await _execute_one(c, task_dir=task_dir, goal_dir=goal_dir, cognition_dirs=cognition_dirs)
+            return await _execute_one(
+                c, task_dir=task_dir, goal_dir=goal_dir,
+                cognition_dirs=cognition_dirs, perm=perm,
+            )
 
     tasks = [_guarded(c) for c in calls]
     gathered = await asyncio.gather(*tasks, return_exceptions=True)
@@ -129,17 +137,28 @@ async def _execute_one(
     task_dir: str | Path | None = None,
     goal_dir: str | Path | None = None,
     cognition_dirs: list[str | Path] | None = None,
+    perm: SixiangPermissionConfig | None = None,
 ) -> ExecutionResult:
     """Execute a single approved tool call."""
     tool_name = call.name
     args = call.arguments
 
-    # Collect all read-only allowed dirs
-    read_allowed: list[Path] = []
-    if goal_dir:
-        read_allowed.append(Path(goal_dir))
-    if cognition_dirs:
-        read_allowed.extend(Path(d) for d in cognition_dirs)
+    # If a permission config is provided, derive all dirs from it
+    if perm is not None:
+        read_allowed = perm.read_allowed_dirs
+        write_allowed = perm.write_allowed_dirs
+        exec_cwds = perm.exec_allowed_cwds
+        yin_root = perm.yin_workspace_root or (Path(task_dir) if task_dir else None)
+    else:
+        # Legacy fallback
+        read_allowed: list[Path] = []
+        if goal_dir:
+            read_allowed.append(Path(goal_dir))
+        if cognition_dirs:
+            read_allowed.extend(Path(d) for d in cognition_dirs)
+        write_allowed = [Path(task_dir)] if task_dir else []
+        exec_cwds = [Path(task_dir)] if task_dir else []
+        yin_root = Path(task_dir) if task_dir else None
 
     # Final path safety re-check for IO tools (uses Yin's comprehensive checks)
     if tool_name in ("write_file", "read_file", "delete_file", "edit_file"):
@@ -162,7 +181,7 @@ async def _execute_one(
                     # Fall through to task_dir check
                     chk_safe, reason = _yin_check_path_safety(
                         path_str,
-                        workspace_root=task_dir,
+                        workspace_root=yin_root,
                         for_write=False,
                     )
                     if not chk_safe:
@@ -173,11 +192,17 @@ async def _execute_one(
                             error=f"[最终防线] {reason}",
                         )
             else:
-                safe, reason = _yin_check_path_safety(
-                    path_str,
-                    workspace_root=task_dir,
-                    for_write=tool_name != "read_file",
-                )
+                # Write operations: check against write_allowed targets
+                safe = False
+                for target in (write_allowed if write_allowed else [yin_root]):
+                    chk_safe, reason = _yin_check_path_safety(
+                        path_str,
+                        workspace_root=target,
+                        for_write=True,
+                    )
+                    if chk_safe:
+                        safe = True
+                        break
                 if not safe:
                     return ExecutionResult(
                         call=call,
@@ -192,7 +217,7 @@ async def _execute_one(
         cwd = args.get("cwd", "")
         if cmd:
             safe, reason = _yin_check_exec_safety(
-                cmd, cwd, workspace_root=Path(task_dir) if task_dir else None,
+                cmd, cwd, workspace_root=yin_root,
             )
             if not safe:
                 return ExecutionResult(
@@ -210,9 +235,29 @@ async def _execute_one(
     # Fallback: delegate to shared builtin executor
     try:
         read_only_dirs = read_allowed if tool_name in ("read_file", "list_directory") else None
-        output = await execute_builtin_tool(tool_name, args, task_dir, read_only_allowed_dirs=read_only_dirs)
+        # Pass write_allowed for edit_file and delete_file too
+        use_write = write_allowed if tool_name in ("write_file", "edit_file", "delete_file") else None
+        output = await execute_builtin_tool(
+            tool_name, args, task_dir,
+            read_only_allowed_dirs=read_only_dirs,
+            write_allowed_dirs=use_write,
+            exec_allowed_cwds=exec_cwds,
+        )
         if output.startswith("[错误]"):
             return ExecutionResult(call=call, status="error", output="", error=output)
+        # ── exec 失败检测：超时或非零退出码 ──────────────────
+        if tool_name == "exec":
+            if "timed out" in output:
+                return ExecutionResult(
+                    call=call, status="exec_failed",
+                    output=output[:8000], error=output[:500],
+                )
+            # 非零退出码（Exit code: 非0）
+            if _has_nonzero_exit(output):
+                return ExecutionResult(
+                    call=call, status="exec_failed",
+                    output=output[:8000], error=output[:500],
+                )
         return ExecutionResult(
             call=call,
             status="success",
@@ -225,6 +270,17 @@ async def _execute_one(
             output="",
             error=str(exc),
         )
+
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+
+def _has_nonzero_exit(output: str) -> bool:
+    """Check if exec output contains a non-zero exit code."""
+    import re
+    return bool(re.search(r"Exit code:\s*([1-9]\d*)", output))
 
 
 # ---------------------------------------------------------------------------

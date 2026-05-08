@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any
@@ -29,6 +30,7 @@ from vingobot.goal.types import (
     ExecutionResult,
     MingjueOutput,
     RoundExecutionFact,
+    SixiangPermissionConfig,
     YangResponse,
 )
 from vingobot.goal.weaver import weave
@@ -40,6 +42,9 @@ _DEFAULT_MAX_ROUNDS = 30
 
 _FACTS_FILE = "06-execution-facts.json"
 """每轮的结构化执行事实持久化文件，位于 task_dir 下"""
+
+_FACTS_WRITE_INTERVAL = 5
+"""每 N 轮写入一次 facts checkpoint（减少 I/O 次数）"""
 
 
 @dataclass
@@ -78,8 +83,8 @@ async def execute_task_inner_loop(
     # Init cognitive usage tracker
     cognitive_usage = CognitionUsage()
 
-    # Cross-round invoke results: previous round's read-only tool outputs
-    previous_invoke_results = ""
+    # Cross-round invoke results: rolling window of tool outputs (up to _RECENT_INVOKE_WINDOW rounds)
+    recent_invoke_results: list[str] = []
 
     # Cross-round Yang thinking: previous round's content (preserves chain of thought)
     previous_yang_content = ""
@@ -88,16 +93,19 @@ async def execute_task_inner_loop(
     read_only_round_count = 0
     # Whether the previous round had a successful write/exec tool
     had_successful_write = False
+    # Self-referential read counter: Yang reading its own execution records
+    self_ref_round_count = 0
 
     for round_num in range(1, max_rounds + 1):
         if signal is not None and signal.cancelled():
             break
 
         # ── 1. 编织器 ─────────────────────────────────────────
+        # Format recent invoke results as a single text blob for Weaver
+        invoke_text_for_weaver = "\n\n---\n\n".join(recent_invoke_results) if recent_invoke_results else ""
         weaver_output = await weave(
             mingjue_output, facts, goal_context, round_num,
-            previous_invoke_results=previous_invoke_results,
-            previous_yang_content=previous_yang_content,
+            previous_invoke_results=invoke_text_for_weaver,
             read_only_round_count=read_only_round_count,
             had_successful_write=had_successful_write,
         )
@@ -112,6 +120,62 @@ async def execute_task_inner_loop(
                 cognitive_usage.skills_used.append(skill_name)
 
         # ── 2. 阳 (native FC) ──────────────────────────────────
+        # Inject previous Yang thinking for cross-round continuity
+        if previous_yang_content:
+            weaver_output.system_prompt += (
+                "\n\n## 你上一轮的思考\n"
+                + (previous_yang_content or "")[:3000]
+                + "\n\n"
+                "（以上是你上一轮的思考结论。无需重新读取相同文件验证，"
+                "直接基于已有信息推进任务。）"
+            )
+
+        # Inject recent invoke results rolling window
+        if recent_invoke_results:
+            parts = []
+            for i, result in enumerate(recent_invoke_results):
+                round_label = round_num - len(recent_invoke_results) + i
+                parts.append(f"### 第{round_label}轮工具执行结果\n{result}")
+            invoke_text = "\n\n---\n\n".join(parts)
+            weaver_output.system_prompt += f"\n\n## 跨轮工具执行结果（最近 {len(recent_invoke_results)} 轮）\n{invoke_text}"
+
+        # Inject execution history path reference (let Yang self-read)
+        weaver_output.system_prompt += (
+            f"\n\n## 完整执行历史\n"
+            f"文件: {task_dir / _FACTS_FILE}\n"
+            f"包含所有 {len(facts)} 轮的结构化执行事实（意图、审批、执行状态）。"
+            f"如需回顾前期轮次的详细决策和失败原因，用 read_file 读取此文件。"
+        )
+
+        # ── Self-referential read warning ───────────────────────
+        if self_ref_round_count >= 1:
+            weaver_output.system_prompt += (
+                f"\n\n## ⚠️ 自指涉读取警告\n"
+                f"你已经连续 {self_ref_round_count} 轮只读取自己的执行记录"
+                f"（06-execution-facts.json 或 outputs/ 目录下的文件）。\n"
+                f"读取自己的执行记录不会推进任务——它只是观察，不是行动。\n"
+                f"**本轮必须产出实质性交付物**：调用 write_file 写入成果文件，"
+                f"或调用 exec 执行任务脚本。\n"
+            )
+            if self_ref_round_count >= 2:
+                weaver_output.system_prompt += (
+                    f"**这是第二次警告。如果再有一轮自指涉读取，系统将强制终止此任务。**\n"
+                )
+
+        # ── Auto-termination: self-referential loop (aggressive) ─
+        if self_ref_round_count >= 3:
+            await _auto_complete(
+                task_dir, facts, round_num,
+                f"自动终止：连续 {self_ref_round_count} 轮自指涉读取（读自己的执行记录），无实质性产出。",
+            )
+            return InnerLoopResult(
+                facts=facts,
+                final_content="任务因自指涉读取循环自动终止。",
+                task_completed=True,
+                rounds_executed=round_num,
+                cognitive_usage=cognitive_usage,
+            )
+
         profile = weaver_output.cognitive_profile
         yang_response = await run_yang(
             system_prompt=weaver_output.system_prompt,
@@ -125,26 +189,22 @@ async def execute_task_inner_loop(
             signal=signal,
         )
 
-        # Persist Yang response
-        _save_round_output(
-            task_dir,
-            round_num,
-            "yang",
-            {
-                "round": round_num,
-                "content": yang_response.content,
-                "reasoning_content": yang_response.reasoning_content,
-                "thinking_blocks": yang_response.thinking_blocks,
-                "tool_calls": yang_response.tool_calls,
-                "called_task_complete": yang_response.called_task_complete,
-            },
-        )
+        # Build per-round output data (思考内容放在最前面)
+        round_data: dict[str, Any] = {
+            "round": round_num,
+            "yang_content": yang_response.content,
+            "reasoning_content": yang_response.reasoning_content,
+            "thinking_blocks": yang_response.thinking_blocks,
+            "tool_calls": yang_response.tool_calls,
+            "called_task_complete": yang_response.called_task_complete,
+        }
 
         # Save Yang's thinking for cross-round continuity
         previous_yang_content = yang_response.content or ""
 
         # If Yang called task_complete → inner loop done
         if yang_response.called_task_complete:
+            _save_round_output(task_dir, round_num, "round", dict(round_data))
             fact = _build_round_fact(
                 round_num, yang_response, "skipped", "", "skipped",
                 yao=profile.current_yao,
@@ -152,7 +212,7 @@ async def execute_task_inner_loop(
                 current_gua=profile.current_gua,
             )
             facts.append(fact)
-            _persist_facts(task_dir, facts)
+            _checkpoint_facts(task_dir, facts, round_num, force=True)
             # Track any cognition tools called in this final round
             _track_cognition_usage(cognitive_usage, yang_response, [])
             return InnerLoopResult(
@@ -165,6 +225,7 @@ async def execute_task_inner_loop(
 
         # No tool calls → text-only response, continue
         if not yang_response.tool_calls:
+            _save_round_output(task_dir, round_num, "round", dict(round_data))
             fact = _build_round_fact(
                 round_num, yang_response, "skipped", "", "skipped",
                 yao=profile.current_yao,
@@ -172,7 +233,7 @@ async def execute_task_inner_loop(
                 current_gua=profile.current_gua,
             )
             facts.append(fact)
-            _persist_facts(task_dir, facts)
+            _checkpoint_facts(task_dir, facts, round_num, force=(round_num == 1))
             # Reset write/read tracking for pure-text rounds — no tools executed
             had_successful_write = False
             read_only_round_count = 0
@@ -192,30 +253,31 @@ async def execute_task_inner_loop(
         cognition_dirs: list[str] | None = None
         if mingjue_output.context and mingjue_output.context.cognition_dirs:
             cognition_dirs = list(mingjue_output.context.cognition_dirs.values())
-        results = await execute_tool_calls(
-            approved_calls,
-            task_dir=task_dir,
-            goal_dir=goal_dir_path,
-            cognition_dirs=cognition_dirs,
+
+        # Build unified permission config
+        perm = SixiangPermissionConfig(
+            task_dir=str(task_dir),
+            goal_dir=str(goal_dir_path) if goal_dir_path else "",
+            workspace_root=str(get_workspace_path().parent),
+            cognition_dirs=[str(d) for d in cognition_dirs] if cognition_dirs else [],
         )
 
-        # Persist round
-        _save_round_output(
-            task_dir,
-            round_num,
-            "exec",
-            {
-                "approved_calls": [
-                    {"name": c.name, "arguments": c.arguments} for c in approved_calls
-                ],
-                "yin_decision": yin_decision,
-                "yin_reason": yin_reason,
-                "results": [
-                    {"status": r.status, "output": r.output[:500], "error": r.error}
-                    for r in results
-                ],
-            },
+        results = await execute_tool_calls(
+            approved_calls,
+            perm=perm,
         )
+
+        # Add exec data to round output and persist (merge exec into same file)
+        round_data["yin_decision"] = yin_decision
+        round_data["yin_reason"] = yin_reason
+        round_data["approved_calls"] = [
+            {"name": c.name, "arguments": c.arguments} for c in approved_calls
+        ]
+        round_data["results"] = [
+            {"status": r.status, "output": r.output[:500], "error": r.error}
+            for r in results
+        ]
+        _save_round_output(task_dir, round_num, "round", dict(round_data))
 
         # Track failed tools for cognition usage
         _track_tool_failures(cognitive_usage, results)
@@ -228,10 +290,14 @@ async def execute_task_inner_loop(
             current_gua=profile.current_gua,
         )
         facts.append(fact)
-        _persist_facts(task_dir, facts)
+        _checkpoint_facts(task_dir, facts, round_num, force=(round_num == 1))
 
-        # Build previous invoke results for next round
-        previous_invoke_results = _format_prev_invoke_results(approved_calls, results)
+        # Build previous invoke results for next round (rolling window)
+        round_invoke = _format_prev_invoke_results(approved_calls, results)
+        if round_invoke:
+            recent_invoke_results.append(round_invoke)
+            if len(recent_invoke_results) > _RECENT_INVOKE_WINDOW:
+                recent_invoke_results.pop(0)
 
         # Detect if this round had a successful write/exec (for next round's force-completion check)
         had_successful_write = any(
@@ -241,13 +307,21 @@ async def execute_task_inner_loop(
 
         # Update consecutive read-only round counter
         if approved_calls and all(c.name in _READ_ONLY_TOOLS for c in approved_calls):
-            read_only_round_count += 1
+            # Check if ALL reads are self-referential (reading own execution records)
+            if all(_is_self_referential(c) for c in approved_calls):
+                self_ref_round_count += 1
+                # Don't count self-referential reads as regular read-only —
+                # reading your own execution facts doesn't advance the task.
+            else:
+                read_only_round_count += 1
+                self_ref_round_count = 0
         else:
             read_only_round_count = 0
+            self_ref_round_count = 0
 
         # ── Auto-termination: self-read loop detected ──────────────
         if read_only_round_count >= _AUTO_TERMINATE_FLOOR and round_num >= _AUTO_TERMINATE_THRESHOLD:
-            _auto_complete(
+            await _auto_complete(
                 task_dir, facts, round_num,
                 f"自动终止：连续 {read_only_round_count} 轮纯读取，已达轮次上限。",
             )
@@ -293,15 +367,23 @@ def _build_round_fact(
             intent = clean
 
     had_action = len(yang.tool_calls) > 0
+    had_failable = any(
+        tc.get("name") in ("exec", "web_search", "web_fetch", "write_file", "edit_file")
+        for tc in (yang.tool_calls or [])
+    )
 
     exec_status = "skipped"
     exec_summary = ""
     if isinstance(results, list):
         successes = sum(1 for r in results if r.status == "success")
-        failures = sum(1 for r in results if r.status in ("error", "blocked"))
+        failures = sum(1 for r in results if r.status in ("error", "blocked", "exec_failed"))
+        exec_failed_count = sum(1 for r in results if r.status == "exec_failed")
         if failures == 0 and successes > 0:
             exec_status = "success"
             exec_summary = f"{successes} 个工具调用成功"
+        elif successes == 0 and failures > 0 and exec_failed_count == failures:
+            exec_status = "exec_failed"
+            exec_summary = f"{exec_failed_count} 个 exec 执行失败（超时或非零退出码）"
         elif successes == 0 and failures > 0:
             exec_status = "failure"
             exec_summary = f"{failures} 个工具调用失败"
@@ -321,6 +403,7 @@ def _build_round_fact(
         yao=yao,
         sixiang=sixiang,
         current_gua=current_gua,
+        had_failable_op=had_failable,
     )
 
 
@@ -345,7 +428,19 @@ def _load_facts(task_dir: Path) -> list[RoundExecutionFact]:
         return []
     try:
         raw = json.loads(facts_path.read_text(encoding="utf-8"))
-        facts = [RoundExecutionFact(**f) for f in raw]
+        facts: list[RoundExecutionFact] = []
+        for f in raw:
+            # Migration: old facts lack had_failable_op
+            if "had_failable_op" not in f:
+                status = f.get("execution_status", "skipped")
+                # These statuses only arise from attempted failable actions
+                if status in ("exec_failed", "failure", "partial_failure"):
+                    f["had_failable_op"] = True
+                elif status == "success" and f.get("tool_call_count", 0) > 0:
+                    f["had_failable_op"] = True
+                else:
+                    f["had_failable_op"] = False
+            facts.append(RoundExecutionFact(**f))
         logger.info("Recovered {} execution facts from {}", len(facts), facts_path)
         return facts
     except (OSError, json.JSONDecodeError, TypeError, ValueError) as e:
@@ -363,6 +458,20 @@ def _persist_facts(task_dir: Path, facts: list[RoundExecutionFact]) -> None:
         )
     except OSError:
         logger.debug("Failed to persist execution facts")
+
+
+def _checkpoint_facts(
+    task_dir: Path,
+    facts: list[RoundExecutionFact],
+    round_num: int,
+    force: bool = False,
+) -> None:
+    """Write facts to disk only every ``_FACTS_WRITE_INTERVAL`` rounds (or on force).
+
+    Reduces I/O from N writes per task to ~N/interval writes.
+    """
+    if force or round_num % _FACTS_WRITE_INTERVAL == 0:
+        _persist_facts(task_dir, facts)
 
 
 def _track_cognition_usage(
@@ -387,8 +496,8 @@ def _track_cognition_usage(
         elif hasattr(tc, "function"):
             name = tc.function.name if hasattr(tc.function, "name") else ""
 
-        if name == "load_grid":
-            # Try to extract which grid was loaded
+        if name == "read_file":
+            # Check if reading a cognition file (grid/model/skill)
             args = {}
             if isinstance(tc, dict):
                 try:
@@ -400,15 +509,18 @@ def _track_cognition_usage(
                     args = json.loads(raw) if isinstance(raw, str) else raw
                 except (json.JSONDecodeError, TypeError):
                     pass
-            grid_name = args.get("name", "")
-            if grid_name and grid_name not in usage.grids_loaded:
-                usage.grids_loaded.append(grid_name)
-
-        elif name == "search_skills":
-            usage.skills_used.append("__searched__")
-
-        elif name == "search_models":
-            usage.models_loaded.append("__searched__")
+            path = args.get("path", "")
+            # Detect grid reads — check for cognition/grids/ in path
+            if "/grids/" in path or "\\grids\\" in path:
+                grid_name = os.path.splitext(os.path.basename(path))[0]
+                if grid_name and grid_name not in usage.grids_loaded:
+                    usage.grids_loaded.append(grid_name)
+            # Detect model reads
+            if "/models/" in path or "\\models\\" in path:
+                usage.models_loaded.append("__read__")
+            # Detect skill reads
+            if "/skills/" in path or "\\skills\\" in path:
+                usage.skills_used.append("__read__")
 
     usage.tool_calls_total += len(yang.tool_calls)
 
@@ -425,10 +537,12 @@ def _track_tool_failures(
                 usage.tools_failed.append(tool_name)
 
 
+_RECENT_INVOKE_WINDOW = 5
+"""跨轮工具输出滚动窗口大小——Yang 可以看到最近 N 轮的执行结果。"""
+
 _READ_ONLY_TOOLS = frozenset({
-    "read_file", "list_directory", "load_grid",
-    "search_skills", "search_models", "web_search", "web_fetch",
-    "search_codebase",
+    "read_file", "list_directory",
+    "web_search", "web_fetch", "search_codebase",
 })
 """Tools whose outputs carry valuable information across rounds."""
 
@@ -436,6 +550,20 @@ _WRITE_TOOLS = frozenset({
     "write_file", "exec",
 })
 """Tools that produce actionable outputs worth summarizing across rounds."""
+
+_SELF_REFERENTIAL_PATTERNS = (
+    "06-execution-facts.json",
+    "outputs/",
+)
+"""File patterns that indicate Yang is reading its own execution records."""
+
+
+def _is_self_referential(call: ApprovedToolCall) -> bool:
+    """Check if a read_file call is reading the task's own execution records."""
+    if call.name != "read_file":
+        return False
+    path = (call.arguments or {}).get("path", "")
+    return any(p in path for p in _SELF_REFERENTIAL_PATTERNS)
 
 
 def _format_prev_invoke_results(
@@ -492,7 +620,7 @@ async def _auto_complete(
     round_num: int,
     reason: str,
 ) -> None:
-    """Save a synthetic final fact, persist it, and write a read summary."""
+    """Save a synthetic final fact and write checkpoint."""
     fact = RoundExecutionFact(
         round=round_num,
         yang_intent_summary=f"[自动终止] {reason}",
@@ -503,86 +631,9 @@ async def _auto_complete(
         tool_call_count=0,
     )
     facts.append(fact)
-    _persist_facts(task_dir, facts)
-    _save_round_output(
-        task_dir, round_num, "yang",
-        {
-            "round": round_num,
-            "content": f"[自动终止] {reason}",
-            "tool_calls": [],
-            "called_task_complete": True,
-        },
-    )
-
-    # Save a read summary for traceability
-    _save_read_summary(task_dir, facts, reason)
+    _checkpoint_facts(task_dir, facts, round_num, force=True)
 
     logger.info("[自动终止] {} (round={}, reason={})", task_dir.name, round_num, reason)
 
 
-_READ_SUMMARY_FILE = "05-read-summary.json"
-"""Summary of what was read during a terminated read-only loop."""
 
-
-def _save_read_summary(
-    task_dir: Path,
-    facts: list[RoundExecutionFact],
-    reason: str,
-) -> None:
-    """Save a summary of what was explored during the read-only loop.
-
-    Builds a deduplicated list of tool calls and their intents from the
-    execution facts so that even auto-terminated tasks leave audit trail.
-    """
-    calls_log: list[dict[str, Any]] = []
-    seen_paths: set[str] = set()
-    read_files: list[str] = []
-    list_dirs: list[str] = []
-
-    # Scan all output files for tool call details
-    out_dir = task_dir / "outputs"
-    if out_dir.is_dir():
-        for fn in sorted(out_dir.iterdir()):
-            if fn.suffix != ".json" or "-exec" not in fn.name:
-                continue
-            try:
-                data = json.loads(fn.read_text(encoding="utf-8"))
-                approved = data.get("approved_calls", [])
-                for call in approved:
-                    name = call.get("name", "")
-                    args = call.get("arguments", {})
-                    path_key = args.get("path", "") or args.get("command", "")
-                    if path_key and path_key not in seen_paths:
-                        seen_paths.add(path_key)
-                        if name == "read_file":
-                            read_files.append(path_key)
-                        elif name == "list_directory":
-                            list_dirs.append(path_key)
-                    calls_log.append({"round": fn.stem.split("-")[0], "tool": name, "args": args})
-            except (OSError, json.JSONDecodeError):
-                pass
-
-    summary = {
-        "reason": reason,
-        "total_rounds": len(facts),
-        "total_tool_calls": sum(f.tool_call_count for f in facts),
-        "files_read": read_files,
-        "directories_listed": list_dirs,
-        "round_facts": [
-            {
-                "round": f.round,
-                "intent": f.yang_intent_summary[:150],
-                "tools": f.tool_call_count,
-                "status": f.execution_status,
-            }
-            for f in facts
-        ],
-    }
-
-    try:
-        (task_dir / _READ_SUMMARY_FILE).write_text(
-            json.dumps(summary, ensure_ascii=False, indent=2),
-            encoding="utf-8",
-        )
-    except OSError:
-        logger.debug("Failed to save read summary to {}", _READ_SUMMARY_FILE)

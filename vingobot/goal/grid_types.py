@@ -90,17 +90,21 @@ class GridFile:
     skills: list[GridSkillRef] = field(default_factory=list)
     """L1 skill references relevant to this domain."""
 
+    source_models: list[str] = field(default_factory=list)
+    """Names of L2 models that this grid was built from (L2→L3 lineage)."""
+
+    source_truths: list[str] = field(default_factory=list)
+    """Names of L4 truths that reference this grid (L4→L3 back-link)."""
+
+    emergence_score: float = 0.0
+    """Emergence score 0.0–1.0 from L2→L3 compression (reserved)."""
+
     workflow: list[GridWorkflowStep] = field(default_factory=list)
     """Recommended execution workflow."""
 
     gaps: list[str] = field(default_factory=list)
     """Identified capability gaps (triggers for learn_skill)."""
 
-    nodes_meta: dict[str, dict[str, Any]] = field(default_factory=dict)
-    """Per-node metadata from legacy sixiang grids (e.g. phase, rule,
-    execution_hint, temperature_override).  Keyed by node name
-    (初爻/二爻/...).  Populated by ``parse_grid()`` when reading legacy
-    format grids."""
 
 
 # ---------------------------------------------------------------------------
@@ -117,13 +121,13 @@ class CognitionUsage:
     """
 
     grids_loaded: list[str] = field(default_factory=list)
-    """Names of grids Yang actually loaded via ``load_grid``."""
+    """Names of grids Yang loaded via read_file."""
 
     skills_used: list[str] = field(default_factory=list)
     """Skill names that Yang discovered and used."""
 
     models_loaded: list[str] = field(default_factory=list)
-    """Model names that Yang loaded via ``search_models``."""
+    """Model names that Yang loaded via read_file."""
 
     tools_failed: list[str] = field(default_factory=list)
     """Tool names that were called but failed during execution."""
@@ -141,6 +145,8 @@ EvolutionActionType = Literal[
     "precipitate_skill",
     "precipitate_model",
     "create_grid",
+    "research",
+    "investigate",
 ]
 
 
@@ -204,6 +210,9 @@ def grid_file_to_dict(g: GridFile) -> dict[str, Any]:
             }
             for s in g.skills
         ],
+        "source_models": g.source_models,
+        "source_truths": g.source_truths,
+        "emergence_score": g.emergence_score,
         "workflow": [
             {
                 "step": w.step,
@@ -213,7 +222,6 @@ def grid_file_to_dict(g: GridFile) -> dict[str, Any]:
             for w in g.workflow
         ],
         "gaps": g.gaps,
-        "nodes_meta": g.nodes_meta,
     }
 
 
@@ -228,20 +236,23 @@ def dict_to_grid_file(d: dict[str, Any]) -> GridFile:
         last_used=d.get("last_used", ""),
         models=[
             GridModelRef(
-                name=m.get("name", ""),
-                path=m.get("path", ""),
-                relevance=m.get("relevance", "supporting"),
+                name=m if isinstance(m, str) else m.get("name", ""),
+                path="" if isinstance(m, str) else m.get("path", ""),
+                relevance="supporting" if isinstance(m, str) else m.get("relevance", "supporting"),
             )
             for m in d.get("models", [])
         ],
         skills=[
             GridSkillRef(
-                name=s.get("name", ""),
-                path=s.get("path", ""),
-                relevance=s.get("relevance", "supporting"),
+                name=s if isinstance(s, str) else s.get("name", ""),
+                path="" if isinstance(s, str) else s.get("path", ""),
+                relevance="supporting" if isinstance(s, str) else s.get("relevance", "supporting"),
             )
             for s in d.get("skills", [])
         ],
+        source_models=d.get("source_models", []),
+        source_truths=d.get("source_truths", []),
+        emergence_score=float(d.get("emergence_score", 0.0)),
         workflow=[
             GridWorkflowStep(
                 step=w.get("step", 0),
@@ -251,7 +262,76 @@ def dict_to_grid_file(d: dict[str, Any]) -> GridFile:
             for w in d.get("workflow", [])
         ],
         gaps=list(d.get("gaps", [])),
-        nodes_meta=d.get("nodes_meta", d.get("nodes", {})),
+    )
+
+
+# ---------------------------------------------------------------------------
+# L4 Truth data structures
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class TruthFile:
+    """Standardised L4 immutable truth JSON format.
+
+    Serialised to/from ``<workspace>/.taiji/cognition/truths/<name>.json``.
+    """
+
+    title: str
+    """Short title for this truth."""
+
+    type: str = "pattern"
+    """Truth category: identity / safety / pattern."""
+
+    version: int = 1
+    """Monotonic version number."""
+
+    immutable: bool = True
+    """Whether this truth is immutable once written."""
+
+    confidence: float = 0.0
+    """Confidence score 0.0–1.0."""
+
+    source_grids: list[str] = field(default_factory=list)
+    """Names of L3 grids this truth was distilled from (L3→L4 lineage)."""
+
+    rules: list[dict[str, Any]] = field(default_factory=list)
+    """Truth statements as list of {id, statement} dicts."""
+
+    updated_at: str = ""
+    """ISO-8601 timestamp of last update."""
+
+
+# ---------------------------------------------------------------------------
+# L4 Truth serialisation helpers
+# ---------------------------------------------------------------------------
+
+
+def truth_file_to_dict(t: TruthFile) -> dict[str, Any]:
+    """Convert a ``TruthFile`` to a JSON-serialisable dict."""
+    return {
+        "title": t.title,
+        "type": t.type,
+        "version": t.version,
+        "immutable": t.immutable,
+        "confidence": t.confidence,
+        "source_grids": t.source_grids,
+        "rules": t.rules,
+        "updated_at": t.updated_at,
+    }
+
+
+def dict_to_truth_file(d: dict[str, Any]) -> TruthFile:
+    """Parse a dict (from JSON) into a ``TruthFile`` instance."""
+    return TruthFile(
+        title=d.get("title", ""),
+        type=d.get("type", "pattern"),
+        version=int(d.get("version", 1)),
+        immutable=bool(d.get("immutable", True)),
+        confidence=float(d.get("confidence", 0.0)),
+        source_grids=list(d.get("source_grids", [])),
+        rules=list(d.get("rules", [])),
+        updated_at=d.get("updated_at", ""),
     )
 
 

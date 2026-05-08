@@ -15,9 +15,8 @@ Approval rules (front layer):
 | Risk level   | Examples                  | Policy                    |
 |--------------|---------------------------|---------------------------|
 | ``read_only``| read_file, list_directory | Auto-approve              |
-|              | search_skills, load_grid  |                           |
 |              | web_search, web_fetch     |                           |
-| ``side_effect`` | write_file, exec       | Front check → LLM layer  |
+| ``side_effect`` | write_file, edit_file, exec, delete_file | Front check → LLM layer  |
 | ``special``  | task_complete             | Auto-approve (no IO)     |
 
 For side-effect tools, the front layer performs:
@@ -49,9 +48,6 @@ _READ_ONLY_TOOLS: frozenset[str] = frozenset(
     {
         "read_file",
         "list_directory",
-        "search_skills",
-        "search_models",
-        "load_grid",
         "web_search",
         "web_fetch",
         "search_codebase",
@@ -78,11 +74,19 @@ _SPECIAL_TOOLS: frozenset[str] = frozenset(
 # Protected cognitive-layer paths — writes to these are rejected by the
 # hardcoded front layer.  The cognitive layer (L1-L5) should only be modified
 # by the agent via approved flows (e.g. Anqu decision, Dream consolidation).
+#
+# NOTE: Only the ``cognition/`` subdirectory under ``.taiji/`` is protected.
+# Writes to ``.taiji/goals/`` (task workspace) are auto-approved — they are
+# the normal working directory for sixiang tasks.
 _PROTECTED_COGNITION_DIRS: frozenset[str] = frozenset(
     {
-        ".taiji",
+        ".taiji/cognition",
     }
 )
+
+# Task workspace prefix — writes under this path are auto-approved by the
+# front layer without reaching the LLM contextual layer.
+_TASK_WORKSPACE_PREFIX = ".taiji/goals"
 
 _PROTECTED_CONFIG_FILES: frozenset[str] = frozenset(
     {
@@ -229,20 +233,26 @@ async def approve(
             auto_approved.append(ApprovedToolCall(name=name, arguments=args))
             continue
         if skill_reason == "auto_approve_false":
-            # Front check → LLM layer
+            # Front check → auto-approve task workspace, LLM layer for others
             check_ok, check_reason = _check_side_effect(name, args, root)
             if check_ok:
-                needs_llm_check.append(tc)
+                if check_reason == "ok_task_workspace":
+                    auto_approved.append(ApprovedToolCall(name=name, arguments=args))
+                else:
+                    needs_llm_check.append(tc)
             else:
                 front_rejected_reasons.append(f"{name}: {check_reason}")
                 logger.warning("[阴·前置] 拒绝技能工具调用: {} — {}", name, check_reason)
             continue
 
-        # Side-effect tools → front check then LLM layer
+        # Side-effect tools → front check (auto-approve task workspace, LLM for others)
         if name in _SIDE_EFFECT_TOOLS:
             check_ok, check_reason = _check_side_effect(name, args, root)
             if check_ok:
-                needs_llm_check.append(tc)
+                if check_reason == "ok_task_workspace":
+                    auto_approved.append(ApprovedToolCall(name=name, arguments=args))
+                else:
+                    needs_llm_check.append(tc)
             else:
                 front_rejected_reasons.append(f"{name}: {check_reason}")
                 logger.warning("[阴·前置] 拒绝工具调用: {} — {}", name, check_reason)
@@ -366,7 +376,10 @@ async def _llm_approve(
         "- 批准：该工具调用符合 L4/L5 约束，可安全执行\n"
         "- 拒绝：该工具调用违反 L4/L5 约束，需说明原因\n"
         "- 不确定时请选择拒绝（保守原则）\n"
-        "- 拒绝理由需引用具体的 L4 真理编号或 L5 原则\n\n"
+        "- 拒绝理由需引用具体的 L4 真理编号或 L5 原则\n"
+        "- **重要**: `.taiji/goals/` 是任务工作区，其中的写入操作是正常且必需的，不应拒绝。"
+        "goal_dir（目标目录）同样在写权限范围内，对其中的写入/编辑操作也是正常且必需的。"
+        "只有 `.taiji/cognition/` 受保护，禁止直接写入。\n\n"
         "请为以下每个工具调用单独输出 JSON:\n"
         "{\n"
         '  "decisions": [\n'
@@ -524,10 +537,17 @@ def _check_path_safety(
         resolved = (workspace_root / path).resolve() if not path.is_absolute() else path.resolve()
         try:
             rel = resolved.relative_to(workspace_root.resolve())
-            # Check if the path targets .taiji/ cognition directories
-            for protected_dir in _PROTECTED_COGNITION_DIRS:
-                if rel.parts[:1] == (protected_dir,):
-                    return False, f"认知层路径受保护，禁止直接写入: {path_str}"
+            rel_str = "/" + str(rel).replace("\\", "/") + "/"
+
+            # Auto-approve writes to task workspace (.taiji/goals/...)
+            # Works regardless of whether .taiji/ is the first path component.
+            # Returns "ok_task_workspace" so the front layer can skip LLM approval.
+            if "/.taiji/goals/" in rel_str:
+                return True, "ok_task_workspace"
+
+            # Reject writes to cognition layer (.taiji/cognition/...)
+            if "/.taiji/cognition/" in rel_str:
+                return False, f"认知层路径受保护，禁止直接写入: {path_str}"
             # Check if the path targets config.json
             if rel.name in _PROTECTED_CONFIG_FILES:
                 return False, f"配置文件受保护，禁止直接写入: {path_str}"
