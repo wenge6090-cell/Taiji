@@ -15,6 +15,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -29,7 +30,7 @@ from vingobot.goal.yin import approve
 # 常量
 # ---------------------------------------------------------------------------
 
-_MINGJUE_MAX_ROUNDS = 5
+_MINGJUE_MAX_ROUNDS = 2
 """明觉探索最多轮次。"""
 
 _ANQU_MAX_ROUNDS = 5
@@ -75,6 +76,7 @@ async def run_mingjue_loop(
     goal_dir: str | None = None,
     cognition_dirs: list[str] | None = None,
     signal: asyncio.Task | None = None,
+    provider: Any = None,
 ) -> LightweightLoopResult:
     """运行明觉的只读探索循环。
 
@@ -91,6 +93,7 @@ async def run_mingjue_loop(
         agent_label="明觉",
         temperature=0.5,
         signal=signal,
+        provider=provider,
     )
 
 
@@ -101,6 +104,7 @@ async def run_anqu_loop(
     goal_dir: str | None = None,
     cognition_dirs: list[str] | None = None,
     signal: asyncio.Task | None = None,
+    provider: Any = None,
 ) -> LightweightLoopResult:
     """运行暗驱的只读验证循环。
 
@@ -116,6 +120,7 @@ async def run_anqu_loop(
         agent_label="暗驱",
         temperature=0.4,
         signal=signal,
+        provider=provider,
     )
 
 
@@ -134,6 +139,7 @@ async def _run_lightweight_core(
     agent_label: str = "",
     temperature: float = 0.5,
     signal: asyncio.Task | None = None,
+    provider: Any = None,
 ) -> LightweightLoopResult:
     """共享的只读探索-决策循环引擎。
 
@@ -200,15 +206,40 @@ async def _run_lightweight_core(
             round_facts=[],
             temperature=temperature,
             signal=signal,
+            provider=provider,
         )
 
         # 保存 Yang 的思考用于跨轮延续
         previous_yang_content = (yang_response.content or "")[:3000]
 
         if yang_response.called_task_complete:
+            # 始终优先 tool_call arguments（LLM 可能同时返回 text + tool_calls，
+            # text 仅是推理文字，arguments 才是正式决策数据）
+            final_content = None
+            for tc in (yang_response.tool_calls or []):
+                if tc.get("name") == "task_complete":
+                    args = tc.get("arguments") or {}
+                    raw = args.get("summary") or ""
+                    # 兼容：summary 本身是 JSON
+                    try:
+                        json.loads(raw)
+                        final_content = raw
+                    except (json.JSONDecodeError, TypeError):
+                        # 从独立参数组装 JSON
+                        obj: dict[str, int | str] = {}
+                        for f in ("summary", "concrete_goal", "trigram", "trigram_reason"):
+                            if f in args:
+                                obj[f] = args[f]
+                        if "goal_progress_pct" in args and args["goal_progress_pct"] is not None:
+                            obj["goal_progress_pct"] = int(args["goal_progress_pct"])
+                        final_content = json.dumps(obj, ensure_ascii=False) if obj else raw
+                    break
+
+            if not final_content:
+                final_content = yang_response.content or ""
             logger.info("[{}探索] 第 {} 轮 task_complete，收集到决策", agent_label, round_num)
             return LightweightLoopResult(
-                final_content=yang_response.content,
+                final_content=final_content,
                 rounds_executed=round_num,
                 task_completed=True,
             )

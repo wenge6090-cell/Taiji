@@ -147,12 +147,15 @@ def build_sixiang_provider_snapshot(config: Config, agent_name: str) -> Provider
     provider = make_provider(config, model=model)
 
     if agent_cfg:
-        if agent_cfg.temperature is not None:
-            provider.generation.temperature = agent_cfg.temperature
-        if agent_cfg.max_tokens is not None:
-            provider.generation.max_tokens = agent_cfg.max_tokens
-        if agent_cfg.reasoning_effort is not None:
-            provider.generation.reasoning_effort = agent_cfg.reasoning_effort
+        # GenerationSettings is frozen — build a new instance if overrides exist
+        temp = agent_cfg.temperature if agent_cfg.temperature is not None else provider.generation.temperature
+        mt = agent_cfg.max_tokens if agent_cfg.max_tokens is not None else provider.generation.max_tokens
+        re_effort = agent_cfg.reasoning_effort if agent_cfg.reasoning_effort is not None else provider.generation.reasoning_effort
+        provider.generation = GenerationSettings(
+            temperature=temp,
+            max_tokens=mt,
+            reasoning_effort=re_effort,
+        )
 
     return ProviderSnapshot(
         provider=provider,

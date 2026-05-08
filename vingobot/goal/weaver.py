@@ -235,13 +235,32 @@ _BASE_TOOL_DEFS: dict[str, dict[str, Any]] = {
         "function": {
             "name": "task_complete",
             "description": "Mark the current task as complete. Call this when you have "
-            "fully achieved the task goal. Provide a summary of what was done.",
+            "fully achieved the task goal. Provide a summary and structured results.",
             "parameters": {
                 "type": "object",
                 "properties": {
                     "summary": {
                         "type": "string",
-                        "description": "Summary of what was accomplished",
+                        "description": "One-line summary of what was accomplished",
+                    },
+                    "concrete_goal": {
+                        "type": "string",
+                        "description": "Detailed task description including expected outcomes and constraints (optional, used by task decomposition)",
+                    },
+                    "trigram": {
+                        "type": "string",
+                        "enum": ["qian", "kun", "zhen", "xun", "kan", "li", "gen", "dui"],
+                        "description": "Bagua trigram for the task nature (optional, used by task decomposition)",
+                    },
+                    "trigram_reason": {
+                        "type": "string",
+                        "description": "Reason for choosing this trigram (optional)",
+                    },
+                    "goal_progress_pct": {
+                        "type": "integer",
+                        "description": "Goal completion percentage 0-100 (optional)",
+                        "minimum": 0,
+                        "maximum": 100,
                     },
                 },
                 "required": ["summary"],
@@ -796,14 +815,6 @@ def _layer_goal_context(
         except Exception:
             pass
 
-    # Cognitive navigation — direct file reading, no tool wrappers
-    ctx = mingjue.context
-    if ctx and ctx.suggested_grids:
-        grids_str = ", ".join(ctx.suggested_grids)
-        parts.append(f"\n## 认知导航\n建议加载的认知网格: {grids_str}")
-        parts.append("用 list_directory 浏览 grids/ 目录，用 read_file 读取网格 JSON 文件。")
-        parts.append("如需搜索技能/模型，用 list_directory 浏览 skills/ 和 models/ 目录，再 read_file 读取匹配文件。")
-
     # L3 grid workflow guidance (path reference — Yang reads grid JSON for full workflow)
     if workflow_guidance:
         parts.append(f"\n## 网格工作流摘要\n当前领域网格包含推荐工作流，完整步骤请用 `read_file` 读取网格 JSON 文件。\n摘要：\n{workflow_guidance[:500]}")
@@ -974,38 +985,31 @@ def _build_cognitive_profile_prompt(
     # Build recent facts summary
     recent_facts_text = _format_recent_facts_for_profile(facts[-5:]) if facts else "（尚无执行历史）"
 
-    system = f"""你是二爻·编织器的认知决策引擎。你的任务是基于三套元认知格栅和执行历史，决定下一轮的认知姿态。
+    system = f"""你是二爻·编织器的认知决策引擎。基于三套元认知格栅和执行历史，决定下一轮的认知姿态。
 
-## 六爻认知阶段格栅 (太极-六爻.json)
+## 元认知格栅
 {liuyao_text}
 
-## 四象思维模式格栅 (太极-四象.json)
 {sixiang_text}
 
-## 八卦情境路由格栅 (太极-八卦.json)
 {bagua_text}
 
 ## 决策原则
-- **六爻推进**: 根据执行结果判断爻位进退。执行成功则推进，被驳回则后退，连续停滞则强推。
+- **六爻推进**: 执行成功则推进，被驳回则后退，连续停滞则强推。
   初爻(接收)→二爻(反思)→三爻(行动)→四爻(调整)→五爻(精通)→上爻(超越)
-- **四象选择**: 根据当前爻位和任务阶段选择匹配的思维模式。
-  少阳(聚焦感知,T≈0.7)/老阳(发散探索,T≈0.8)/少阴(精准执行,T≈0.3)/老阴(批判反思,T≈0.2)
-- **八卦路由**: 根据任务情境切换卦象。
-  乾(创造)/坤(积累)/震(启动)/巽(渗透)/坎(风险)/离(澄清)/艮(暂停评估)/兑(表达)
-- **动态参数**: temperature/top_p/top_k/repetition_penalty 需与四象模式匹配，根据卦象动态微调。
-  严谨类卦象(坎/离/艮)收敛参数，发散类卦象(乾/震/兑)放宽参数。
+- **四象选择**: 少阳(聚焦,T≈0.7)/老阳(发散,T≈0.8)/少阴(精准,T≈0.3)/老阴(批判,T≈0.2)
+- **八卦路由**: 乾(创造)/坤(积累)/震(启动)/巽(渗透)/坎(风险)/离(澄清)/艮(暂停)/兑(表达)
+- **动态参数**: 严谨类卦象(坎/离/艮)收敛参数，发散类卦象(乾/震/兑)放宽参数
 
 ## 当前状态
-- 当前爻位: {state.current_yao}
-- 当前卦象: {state.current_gua}
-- 当前四象: {state.current_sixiang}
+- 爻位: {state.current_yao} | 卦象: {state.current_gua} | 四象: {state.current_sixiang}
 - 第 {round_num}/{max_rounds} 轮
 
 ## 执行历史（最近5轮）
 {recent_facts_text}
 
-请以 JSON 格式输出下一轮的认知画像。只输出 JSON，不要其他文字：
-```json
+## 输出格式
+输出以下 JSON，不要其他文字：
 {{
   "current_yao": <1-6 整数>,
   "current_gua": "<乾|坤|震|巽|坎|离|艮|兑>",
@@ -1014,11 +1018,10 @@ def _build_cognitive_profile_prompt(
   "top_p": <0.5-1.0 浮点数>,
   "top_k": <1-100 整数>,
   "repetition_penalty": <0.8-1.5 浮点数>,
-  "yao_reasoning": "<爻位推进理由，20字左右>",
-  "sixiang_reasoning": "<四象选择理由，20字左右>",
-  "gua_reasoning": "<卦象路由理由，20字左右>"
-}}
-```"""
+  "yao_reasoning": "<爻位推进理由>",
+  "sixiang_reasoning": "<四象选择理由>",
+  "gua_reasoning": "<卦象路由理由>"
+}}"""
 
     user = f"当前任务: {mingjue.concrete_goal or mingjue.summary}\n目标ID: {mingjue.goal_id}"
 

@@ -215,9 +215,17 @@ async def execute_task_inner_loop(
             _checkpoint_facts(task_dir, facts, round_num, force=True)
             # Track any cognition tools called in this final round
             _track_cognition_usage(cognitive_usage, yang_response, [])
+            # 当 LLM 通过 tool_calls 调用 task_complete 时 content 可能为空
+            final_content = yang_response.content
+            if not final_content:
+                for tc in (yang_response.tool_calls or []):
+                    if tc.get("name") == "task_complete":
+                        args = tc.get("arguments") or {}
+                        final_content = args.get("summary") or args.get("content") or ""
+                        break
             return InnerLoopResult(
                 facts=facts,
-                final_content=yang_response.content,
+                final_content=final_content,
                 task_completed=True,
                 rounds_executed=round_num,
                 cognitive_usage=cognitive_usage,

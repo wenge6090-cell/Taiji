@@ -187,12 +187,11 @@ async def _evaluate_goal_progress(
 
 你的唯一使命：推动目标走向完成。
 
-你拥有验证能力——在做出决策前，你可以：
-- 用 list_directory 查看目标目录和任务输出目录
-- 用 read_file 读取蓝图、任务输出文件、记忆文件、认知库文件
-- 用 query_capabilities 了解当前执行环境能力
+你可以使用以下验证能力在决策前收集证据：
+- list_directory / read_file — 查看目标目录、任务输出、蓝图、记忆、认知库
+- query_capabilities — 了解执行环境能力
 
-认知库路径（可用 read_file 直接读取）：
+认知库路径：
 - .vingobot/.taiji/cognition/skills/ — L1 技能定义
 - .vingobot/.taiji/cognition/models/ — L2 经验模型
 - .vingobot/.taiji/cognition/grids/ — L3 认知格栅
@@ -222,45 +221,31 @@ Yang 的最终输出:
 {cognitive_context}
 
 ## 决策指南
-- 如果所有完成标准都已满足 → goal_completed
-- 如果目标明显无法达成 → goal_failed
-- 如果当前任务结果不完整或质量不高 → continue_task / verify_task / learn_task
-- 如果目标还有差距 → goal_next_task 并给出清晰可执行的下一步
-- **next_task_concrete_action（重要）**：如果 goal_next_task，必须给出下一任务的**第一步具体行动**。
-  格式: "write_file outputs/05-xxx.py 产出..." 或 "读取 outputs/03-xxx.md 了解现状后 write_file 产出..."
-  **必须包含文件路径和工具名**，不能只写抽象描述。杨会以此为第一轮的直接指令。
+- 所有完成标准都已满足 → goal_completed
+- 目标明显无法达成 → goal_failed
+- 任务结果不完整或质量不高 → continue_task / verify_task / learn_task
+- 目标还有差距 → goal_next_task 并给出清晰可执行的下一步
+- **next_task_concrete_action（重要）**：必须给出下一任务的第一步具体行动，格式如 "write_file outputs/05-xxx.py 产出..."。**必须包含文件路径和工具名**。
 
 ## 认知演化指南 (evolution 数组)
 
-你的认知演化指令会被交给 **DMN（Default Mode Network）** — 一个专门的后台认知管家来处理。
-DMN 的能力包括：
-- **搜索网络**：用 web_search 查找新工具、库、解决方案
-- **分析失败**：读取任务目录的执行事实（06-execution-facts.json）和输出文件，深入诊断根因
-- **创建认知资产**：生成 L1 技能、L2 模型、L3 格栅、L4 真理
-- **自由维护**：检查 meta.json、归档、更新认知库
+你的演化指令会被交给 **DMN（Default Mode Network）** — DMN 会通过任务目录直接获取执行数据，
+自主完成分析、搜索和认知资产创建。你只需准确判断"需要做什么"：
 
-**你不需要提供详细的执行上下文**。DMN 会直接读取任务目录（已自动附在演化任务中）来获取执行数据。
-你只需准确判断"需要做什么"：
-
-- 如果任务中因缺少必要技能或工具而失败 → learn_skill (priority 6-8)
-- 如果任务中形成了可复用的工作模式/SOP → precipitate_skill (priority 4-6)
-- 如果任务中产出了有价值的方法论或思维模型 → precipitate_model (priority 3-5)
-  **提示**: 任务的执行过程本身就是最佳学习材料。即使没有显式的新方法论，
-  分析执行Facts中的成功模式和失败教训也值得沉淀为经验模型。
-- 如果发现需要新的认知领域格栅 → create_grid (priority 2-4)
-  **提示**: 用当前目标ID作为领域名称，将沉淀的技能和模型整合为该领域的认知网格。
-  对于有 2 个以上已完成任务的目标，考虑创建领域格栅。
-- ✅ 如果工具/库用法有疑问、现有方案在特定平台出错 → research (priority 5-8)
-  DMN 会用 web_search 查找最佳实践、替代方案或修复方法。
+- **learn_skill** (priority 6-8) — 任务因缺少必要技能或工具而失败
+- **research** (priority 5-8) — 工具/库用法有疑问、现有方案在特定平台出错
   例如："exec 工具在 Windows 引号转义有问题，研究跨平台最佳实践"
-- ✅ 如果失败原因不明确、需要深入分析执行数据 → investigate (priority 3-6)
-  DMN 会读取完整的执行事实和输出文件，诊断根因并给出改进建议。
+- **investigate** (priority 3-6) — 失败原因不明确，需深入分析执行数据
   例如："第 5-8 轮反复失败原因不明，请深入分析 execution-facts"
+- **precipitate_skill** (priority 4-6) — 形成了可复用的工作模式/SOP
+- **precipitate_model** (priority 3-5) — 产出了有价值的方法论或思维模型
+  提示：执行过程本身就是最佳学习材料，成功模式和失败教训都值得沉淀
+- **create_grid** (priority 2-4) — 需要新的认知领域格栅
+  提示：对于有 2 个以上已完成任务的目标，考虑创建领域格栅
 - 如无需演化 → 空数组 []
 
 **关键原则**: 让每一次任务执行都沉淀为可复用的认知资产。
-任务执行数据(06-execution-facts.json)和输出文件会随演化任务传递给DMN进行分析。
-所以请大胆决策，DMN会基于真实数据生成资产。
+DMN 会通过任务目录直接获取执行数据自主分析。请大胆决策。
 
 ## 输出格式
 调查完成后，调用 task_complete，summary 字段输出以下 JSON：
@@ -271,7 +256,7 @@ DMN 的能力包括：
   "decision": "goal_next_task | goal_completed | goal_failed | continue_task | verify_task | learn_task",
   "next_task_description": "如果 goal_next_task，给出下一个具体任务描述",
   "next_task_concrete_action": "如果 goal_next_task，给出第一步具体行动（含文件路径和工具名）",
-  "suggested_trigram": "如果 goal_next_task，建议下一任务的卦象: qian(乾/探索) | kun(坤/执行) | zhen(震/变革) | xun(巽/分析) | kan(坎/攻坚) | li(离/整理) | gen(艮/审视) | dui(兑/沟通)。根据任务性质和已发现问题选择，避免连续重复",
+  "suggested_trigram": "如果 goal_next_task，卦象: qian(乾)|kun(坤)|zhen(震)|xun(巽)|kan(坎)|li(离)|gen(艮)|dui(兑)，避免连续重复",
   "reason": "决策理由",
   "completion_note": "如果 goal_completed，总结目标成就",
   "evolution": [
@@ -301,23 +286,26 @@ DMN 的能力包括：
         # Use precise task count from outer loop, fallback to goal_context estimate
         effective_total = total_tasks if total_tasks > 0 else (len(goal_context.recent_task_statuses or []) + 1)
 
+        anqu_provider = _get_provider()
+
         result = await run_anqu_loop(
             task_dir=goal_dir_path,
             system_prompt=system_prompt,
             goal_dir=goal_dir_path,
             cognition_dirs=cognition_dirs,
             signal=signal,
+            provider=anqu_provider,
         )
 
         if result.task_completed and result.final_content:
             parsed = _parse_anqu_json(result.final_content)
         else:
             logger.warning("[暗驱] 轻量循环未完成，使用回退")
-            return _fallback_anqu(final_content, facts, cognitive_usage, total_tasks=effective_total, mingjue_progress_pct=mingjue_progress_pct)
+            return _fallback_anqu(final_content, facts, cognitive_usage, total_tasks=effective_total, mingjue_progress_pct=mingjue_progress_pct, task_dir=task_dir)
 
     except Exception:
         logger.exception("[暗驱] 轻量验证循环失败")
-        return _fallback_anqu(final_content, facts, cognitive_usage, total_tasks=effective_total, mingjue_progress_pct=mingjue_progress_pct)
+        return _fallback_anqu(final_content, facts, cognitive_usage, total_tasks=effective_total, mingjue_progress_pct=mingjue_progress_pct, task_dir=task_dir)
 
     decision_raw = parsed.get("decision", "goal_next_task")
     action = _normalize_action(decision_raw)
@@ -328,6 +316,13 @@ DMN 的能力包括：
         source_task_id="",
         source_goal_id=getattr(goal_context, "goal_id", ""),
     )
+
+    # Supplement with computed actions if LLM returned empty evolution
+    if not evolution:
+        evolution = _compute_evolution_actions(
+            final_content, facts, cognitive_usage, task_dir,
+            total_tasks=effective_total,
+        )
 
     return AnquDecision(
         action=action,
@@ -423,12 +418,112 @@ def _parse_evolution_actions(
     return actions
 
 
+def _compute_evolution_actions(
+    final_content: str,
+    facts: list[RoundExecutionFact],
+    cognitive_usage: CognitionUsage | None = None,
+    task_dir: str = "",
+    total_tasks: int = 0,
+) -> list[CognitionEvolutionAction]:
+    """Compute evolution actions from execution facts.
+
+    Used as a supplement when the LLM path returns empty evolution.
+    Actions are ordered by priority; only the highest-priority action triggers.
+    """
+    summary = (final_content or "")[:500]
+    round_count = len(facts)
+    successes = sum(1 for f in facts if f.execution_status == "success")
+    failures = sum(1 for f in facts if f.execution_status in ("failure", "partial_failure", "exec_failed"))
+    task_label = Path(task_dir).name if task_dir else "unknown"
+
+    # Tool failures → learn_skill (highest priority — broken tool blocks progress)
+    if cognitive_usage and cognitive_usage.tools_failed:
+        return [
+            CognitionEvolutionAction(
+                action="learn_skill",
+                target_name=f"fix_{t.replace('-', '_')}",
+                description=f"修复/学习工具 '{t}' 的正确用法",
+                priority=6,
+            )
+            for t in cognitive_usage.tools_failed[:2]
+        ]
+
+    # High failure rate or many rounds with failures → investigate
+    if failures > 0 and (failures / max(round_count, 1) >= 0.3 or (round_count >= 10 and failures > 0)):
+        fail_rate = failures / max(round_count, 1)
+        priority = 6 if fail_rate >= 0.5 else (5 if fail_rate >= 0.3 else 4)
+        return [
+            CognitionEvolutionAction(
+                action="investigate",
+                target_name=f"task_failure_{task_label}",
+                description=(
+                    f"该任务完成了 {round_count} 轮（{successes} 成功/{failures} 失败），"
+                    f"失败率 {fail_rate:.0%}，请分析失败根因并提出改进建议。"
+                    f"执行摘要: {summary[:200]}"
+                ),
+                priority=priority,
+            )
+        ]
+
+    # Pure successful task with clean execution → precipitate_model
+    if successes >= 3 and failures == 0 and task_dir:
+        outputs_dir = Path(task_dir) / "outputs"
+        if outputs_dir.is_dir() and any(outputs_dir.iterdir()):
+            return [
+                CognitionEvolutionAction(
+                    action="precipitate_model",
+                    target_name=f"task_method_{task_label}",
+                    description=(
+                        f"该任务纯顺利完成了 {round_count} 轮（{successes} 成功），"
+                        f"执行模式干净，值得抽象为通用的L2经验模型。"
+                        f"任务摘要: {summary[:300]}"
+                    ),
+                    priority=4,
+                )
+            ]
+
+    # Successful task with outputs → precipitate_skill
+    if successes >= 2 and task_dir:
+        outputs_dir = Path(task_dir) / "outputs"
+        if outputs_dir.is_dir() and any(outputs_dir.iterdir()):
+            return [
+                CognitionEvolutionAction(
+                    action="precipitate_skill",
+                    target_name=f"task_experience_{task_label}",
+                    description=(
+                        f"该任务完成了 {round_count} 轮（{successes} 成功/{failures} 失败），"
+                        f"产出了具体交付物。请分析其执行流程和SOP，沉淀为可复用的L1技能。"
+                        f"任务摘要: {summary[:300]}"
+                    ),
+                    priority=5,
+                )
+            ]
+
+    # Multiple tasks completed → create_grid (cross-task domain organization)
+    if total_tasks >= 3:
+        return [
+            CognitionEvolutionAction(
+                action="create_grid",
+                target_name="goal_achievement_grid",
+                description=(
+                    f"该目标已完成了 {total_tasks} 个任务。"
+                    f"请分析所有任务的执行经验（产物、SOP、模式），"
+                    f"创建或更新L3认知格栅以整合该领域的认知资产。"
+                ),
+                priority=3,
+            )
+        ]
+
+    return []
+
+
 def _fallback_anqu(
     final_content: str,
     facts: list[RoundExecutionFact],
     cognitive_usage: CognitionUsage | None = None,
     total_tasks: int = 0,
     mingjue_progress_pct: int | None = None,
+    task_dir: str = "",
 ) -> AnquDecision:
     """LLM-less fallback — use execution statistics for guidance."""
     summary = (final_content or "")[:500]
@@ -466,19 +561,10 @@ def _fallback_anqu(
         concrete_action = "先读取 outputs/ 目录中已有产出了解进展，再用 write_file 产出下一步交付物"
         suggested_trigram = "kun"  # 默认执行
 
-    evolution: list[CognitionEvolutionAction] = []
-
-    # Check for tool failures in the fallback path too
-    if cognitive_usage and cognitive_usage.tools_failed:
-        evolution = [
-            CognitionEvolutionAction(
-                action="learn_skill",
-                target_name=f"fix_{t.replace('-', '_')}",
-                description=f"修复/学习工具 '{t}' 的正确用法",
-                priority=6,
-            )
-            for t in cognitive_usage.tools_failed[:2]
-        ]
+    evolution = _compute_evolution_actions(
+        final_content, facts, cognitive_usage, task_dir,
+        total_tasks=total_tasks,
+    )
 
     return AnquDecision(
         action="goal_next_task",

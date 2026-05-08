@@ -8,6 +8,8 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import json
+import os
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
@@ -54,38 +56,122 @@ def print_queue() -> None:
         print(f"    - [{t.goal_id}] {t.description[:80]}")
 
 
-async def monitor_loop(pool: WorkerPool, interval: float = 3.0) -> None:
-    """监控循环：定时打印目标和队列状态"""
-    print_header("监控开始 — 每 3 秒刷新状态")
-    
+async def monitor_loop(pool: WorkerPool, interval: float = 5.0) -> None:
+    """监控循环：目标变化时显示详情，空闲时静默，30秒心跳保活。"""
+    print_header("监控运行中 — 状态变化时自动输出详情")
+
     last_goals = None
+    last_active_goals: dict[str, int] = {}
+    heartbeat_elapsed = 0
+
     while pool.running:
         await asyncio.sleep(interval)
-        
-        # 检查目标变化
+        heartbeat_elapsed += interval
+
         current_goals = get_all_goals()
         current_state = {(g.id, g.status, g.rounds_completed) for g in current_goals}
-        
-        if current_state != last_goals:
+        current_active = pool.get_active_goals()
+
+        changed = current_state != last_goals
+        active_changed = current_active != last_active_goals
+
+        if changed:
             print(f"\n--- [{datetime.now().strftime('%H:%M:%S')}] 状态变化 ---")
             print_goals()
             print_queue()
             last_goals = current_state
-        
-        # 显示活跃 worker 数
-        active = pool.active_count
-        active_goals = pool.get_active_goals()
-        if active_goals:
-            goals_str = ", ".join(f"{gid}(w{wid})" for gid, wid in active_goals.items())
-            print(f"  [workers active: {active}] 正在处理: {goals_str}")
-        
-        # 检查是否所有任务都完成了
+            _print_latest_round(current_active)
+            heartbeat_elapsed = 0
+        elif active_changed:
+            if current_active:
+                goals_str = ", ".join(f"{gid}(w{wid})" for gid, wid in current_active.items())
+                print(f"  [worker] 开始处理: {goals_str}")
+            else:
+                print(f"  [worker] 处理完成")
+            last_active_goals = dict(current_active)
+            heartbeat_elapsed = 0
+
+        # 30秒心跳：无状态变化时提醒仍在运行
+        if heartbeat_elapsed >= 30:
+            if current_active:
+                gid = next(iter(current_active))
+                meta = read_goal_meta(gid)
+                rounds = meta.rounds_completed if meta else "?"
+                print(f"  [心跳] 仍在运行 — {gid} 已完成 {rounds} 轮")
+            heartbeat_elapsed = 0
+
+        # 检查完成条件
         all_done = all(g.status in ("completed", "failed") for g in current_goals if g.id != "default")
         if all_done and not PendingQueue().scan_pending():
             print("\n  所有非默认目标已完成，队列为空。")
             break
-    
+
     print_header("监控结束")
+
+
+def _print_latest_round(active_goals: dict[str, int]) -> None:
+    """读取活跃目标的最新轮次输出，打印工具调用摘要。"""
+    if not active_goals:
+        return
+    gid = next(iter(active_goals))
+    taiji = os.path.expanduser("~/.vingobot/.taiji")
+    tasks_dir = Path(taiji) / "goals" / gid / "tasks"
+    if not tasks_dir.is_dir():
+        return
+
+    # 找最新的任务目录
+    task_dirs = sorted(tasks_dir.iterdir(), key=lambda p: p.stat().st_mtime, reverse=True)
+    for td in task_dirs[:3]:
+        if not td.is_dir():
+            continue
+        outputs_dir = td / "outputs"
+        if not outputs_dir.is_dir():
+            continue
+        round_files = sorted(outputs_dir.glob("*-round.json"),
+                             key=lambda p: int(p.stem.split("-")[0]))
+        if not round_files:
+            continue
+
+        latest = round_files[-1]
+        try:
+            data = json.loads(latest.read_text(encoding="utf-8"))
+        except (json.JSONDecodeError, OSError):
+            continue
+
+        rn = data.get("round", "?")
+        tc = data.get("tool_calls") or []
+        called_tc = data.get("called_task_complete", False)
+        yin = data.get("yin_decision", "")
+
+        # 生成工具摘要：name(param=val) 格式
+        tools_str = ", ".join(
+            _short_tool(c) for c in tc[:4]
+        )
+        if len(tc) > 4:
+            tools_str += f" +{len(tc)-4}"
+
+        status = "✅ 完成" if called_tc else "⏳ 处理中"
+        if "rejected" in yin:
+            status = "❌ 被拒"
+
+        task_name = td.name
+        print(f"  ── {task_name} 第{rn}轮 {status}")
+        if tools_str:
+            print(f"     工具: {tools_str}")
+        break
+
+
+def _short_tool(call: dict) -> str:
+    """工具调用摘要，如 write_file(path=...)"""
+    name = call.get("name", "?")
+    args = call.get("arguments") or {}
+    # 选第一个有意义的参数
+    for key in ("path", "command", "url", "query", "content"):
+        val = args.get(key)
+        if val:
+            s = str(val)[:40]
+            return f"{name}({key}={s})"
+    return name
 
 
 async def main() -> None:

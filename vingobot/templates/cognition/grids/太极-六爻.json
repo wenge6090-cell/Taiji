@@ -11,7 +11,7 @@
       "典型状态": "开放接收、无预设观察",
       "phase": "初始/基础",
       "rule": "开放接收，无预设观察，充分收集原始素材后再进入下一步",
-      "execution_hint": "多使用 [invoke] 和 load_grid 读取信息，不要急于输出 <action>",
+      "execution_hint": "多使用 read_file/list_directory 读取信息和认知库，不要急于输出 <action>",
       "temperature_override": 0.3
     },
     "二爻": {
@@ -21,7 +21,7 @@
       "典型状态": "分类、关联已有知识",
       "phase": "内在/反思",
       "rule": "初步内化信息，识别模式，将新知识与已有知识关联",
-      "execution_hint": "先 search_skills/search_models 搜索认知库，将新信息与已有知识关联",
+      "execution_hint": "先用 list_directory 浏览认知库目录，再 read_file 读取相关文件，将新信息与已有知识关联",
       "temperature_override": 0.35
     },
     "三爻": {

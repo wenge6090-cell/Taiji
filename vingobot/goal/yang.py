@@ -34,6 +34,7 @@ async def run_yang(
     top_k: int | None = None,
     repetition_penalty: float | None = None,
     signal: asyncio.Task | None = None,
+    provider: Any = None,
 ) -> YangResponse:
     """Call the LLM with native Function Calling for one round.
 
@@ -47,6 +48,9 @@ async def run_yang(
         top_k: Top-k sampling limit.
         repetition_penalty: Penalty for token repetition.
         signal: Optional cancellation token.
+        provider: Optional explicit provider.  When provided, overrides
+            the internally resolved yang provider.  Used by lightweight
+            loops (mingjue/anqu) that need a different model.
 
     Returns:
         YangResponse with content and parsed tool_calls.
@@ -64,12 +68,12 @@ async def run_yang(
     ]
 
     try:
-        provider = _get_provider()
-        if provider is None:
+        effective_provider = provider or _get_provider()
+        if effective_provider is None:
             logger.error("[阳] 无可用 LLM provider")
             return YangResponse(content="[错误] 无可用 LLM provider")
 
-        response = await provider.chat_with_retry(
+        response = await effective_provider.chat_with_retry(
             messages=messages,
             tools=tool_definitions if tool_definitions else None,
             tool_choice="auto",

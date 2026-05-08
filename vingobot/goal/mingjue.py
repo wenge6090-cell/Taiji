@@ -23,61 +23,6 @@ from vingobot.core.goal_context import GoalContext
 from vingobot.core.workspace import get_workspace_paths
 from vingobot.goal.types import MingjueContextInfo, MingjueOutput, MingjueSource
 
-# ---------------------------------------------------------------------------
-# Trigram routing table — maps八卦 to suggested skills/grids
-# ---------------------------------------------------------------------------
-
-_TRIGRAM_ROUTING: dict[str, dict[str, Any]] = {
-    "qian": {  # 乾 — creativity, exploration
-        "label": "乾·天行",
-        "energy": "creative",
-        "suggested_grids": ["exploration", "creative-thinking"],
-        "suggested_skills": ["read_file", "list_directory"],
-    },
-    "kun": {  # 坤 — execution, grounded
-        "label": "坤·地势",
-        "energy": "execution",
-        "suggested_grids": ["execution", "methodical"],
-        "suggested_skills": ["read_file", "write_file", "list_directory"],
-    },
-    "zhen": {  # 震 — change, disruption
-        "label": "震·雷动",
-        "energy": "transformative",
-        "suggested_grids": ["refactor", "problem-solving"],
-        "suggested_skills": ["read_file", "write_file", "exec"],
-    },
-    "xun": {  # 巽 — analysis, penetration
-        "label": "巽·风入",
-        "energy": "analytical",
-        "suggested_grids": ["analysis", "decomposition"],
-        "suggested_skills": ["read_file", "list_directory"],
-    },
-    "kan": {  # 坎 — difficulty, depth
-        "label": "坎·水险",
-        "energy": "persistent",
-        "suggested_grids": ["debugging", "deep-dive"],
-        "suggested_skills": ["read_file", "list_directory"],
-    },
-    "li": {  # 离 — clarity, illumination
-        "label": "离·火明",
-        "energy": "illuminating",
-        "suggested_grids": ["clarification", "documentation"],
-        "suggested_skills": ["read_file", "write_file"],
-    },
-    "gen": {  # 艮 — stillness, boundary
-        "label": "艮·山止",
-        "energy": "boundary-setting",
-        "suggested_grids": ["constraint", "minimal-touch"],
-        "suggested_skills": ["read_file"],
-    },
-    "dui": {  # 兑 — communication, expression
-        "label": "兑·泽悦",
-        "energy": "communicative",
-        "suggested_grids": ["communication", "report-generation"],
-        "suggested_skills": ["read_file", "write_file", "task_complete"],
-    },
-}
-
 
 # ---------------------------------------------------------------------------
 # Public API
@@ -145,8 +90,6 @@ def _from_continuation(goal_context: GoalContext, source: MingjueSource) -> Ming
                 "models": str(wp.models),
                 "grids": str(wp.grids),
             },
-
-            suggested_grids=["execution"],
         ),
     )
 
@@ -232,18 +175,18 @@ async def _from_initial(
 
     system_prompt = f"""你是初爻·明觉，负责将模糊目标翻译为具体可执行的任务。
 
-你拥有探索能力——在做出决策前，你可以：
-- 用 list_directory 查看目标目录结构
-- 用 read_file 读取阶段报告、蓝图、记忆、认知库等文件
-- 用 query_capabilities 了解当前执行环境能力
+你可以使用以下探索能力在决策前收集信息：
+- list_directory / read_file — 查看目标目录、阶段报告、蓝图、记忆、认知库
+- query_capabilities — 了解执行环境能力
 
-认知库路径（可用 list_directory + read_file 探索）：
+认知库路径：
 - skills/ — L1 技能定义
 - models/ — L2 经验模型
 - grids/ — L3 认知格栅（JSON 含 source_truths/models/skills 跨层链接）
 - truths/ — L4 不可变底层真理
 
-**不要在信息不足时空想。先探索，再决策。**
+**快速决策优先**：当前上下文中已包含蓝图/记忆/轨迹/文件清单等完整信息。
+最多探索 1 轮文件读取后必须调用 task_complete。
 
 ## 当前目标上下文
 - 蓝图摘要: {blueprint_snippet}
@@ -257,33 +200,27 @@ async def _from_initial(
 {phase1_text}
 
 ## 八卦路由表（根据任务性质选择一卦）
-- 乾(qian): 探索、创造 → 适合需要大量搜索、学习的新任务
-- 坤(kun): 执行、落地 → 适合明确的文件操作、批量修改
-- 震(zhen): 变革、重构 → 适合代码修改、重构
-- 巽(xun): 分析、渗透 → 适合深入分析、问题定位
-- 坎(kan): 深潜、攻坚 → 适合疑难问题、调试
-- 离(li): 明澈、输出 → 适合文档、总结、整理
-- 艮(gen): 止观、审视 → 适合只读分析、评估
-- 兑(dui): 沟通、报告 → 适合生成报告、完成总结
+- **qian**(乾/探索) — 需要大量搜索、学习的新任务
+- **kun**(坤/执行) — 明确的文件操作、批量修改
+- **zhen**(震/变革) — 代码修改、重构
+- **xun**(巽/分析) — 深入分析、问题定位
+- **kan**(坎/攻坚) — 疑难问题、调试
+- **li**(离/整理) — 文档、总结、整理
+- **gen**(艮/审视) — 只读分析、评估
+- **dui**(兑/沟通) — 生成报告、完成总结
 
 ## 输出格式
-信息收集充分后，调用 task_complete，summary 字段输出以下 JSON：
-
-{{
-  "summary": "一句话总结本任务",
-  "concrete_goal": "详细的任务描述，包含期望成果和约束",
-  "trigram": "qian|kun|zhen|xun|kan|li|gen|dui",
-  "trigram_reason": "选择此卦的理由",
-  "goal_progress_pct": 0-100
-}}
+信息收集充分后，调用 task_complete，填入以下参数：
+- **summary** — 一句话总结本任务（纯文本）
+- **concrete_goal** — 详细的任务描述，包含期望成果和约束
+- **trigram** — 选卦：qian|kun|zhen|xun|kan|li|gen|dui
+- **trigram_reason** — 选择此卦的理由
+- **goal_progress_pct** — 目标整体完成百分比（0-100）
 
 **goal_progress_pct**: 基于当前蓝图、已完成任务和记忆，评估**目标整体**的完成百分比。
-- 新目标从 0 开始
-- 每个成功任务推进 10-30%
-- 客观评估，不要过度乐观
-- 暗驱稍后会复核你的判断
+新目标从 0 开始，每个成功任务推进 10-30%。客观评估，暗驱稍后会复核。
 
-直接输出 JSON，不要包裹在 markdown 代码块中。
+通过函数参数传入，不要包裹在额外的 markdown 代码块中。
 """
 
     try:
@@ -296,12 +233,15 @@ async def _from_initial(
             str(wp.grids),
         ]
 
+        mingjue_provider = _get_provider()
+
         result = await run_mingjue_loop(
             task_dir=goal_dir_path,
             system_prompt=system_prompt,
             goal_dir=goal_dir_path,
             cognition_dirs=cognition_dirs,
             signal=signal,
+            provider=mingjue_provider,
         )
 
         if result.task_completed and result.final_content:
@@ -315,16 +255,15 @@ async def _from_initial(
         return _fallback_mingjue(goal_context, source)
 
     trigram = parsed.get("trigram", "kun")
-    routing = _TRIGRAM_ROUTING.get(trigram, _TRIGRAM_ROUTING["kun"])
     parsed_pct = _parse_progress_pct(parsed.get("goal_progress_pct"))
 
     return MingjueOutput(
         intent="task",
         goal_id=goal_context.goal_id,
-        summary=parsed.get("summary", source.description[:100]),
-        concrete_goal=parsed.get("concrete_goal", source.description),
+        summary=parsed.get("summary") or source.description[:100],
+        concrete_goal=parsed.get("concrete_goal") or source.description,
         trigram=trigram,
-        trigram_reason=parsed.get("trigram_reason", routing["label"]),
+        trigram_reason=parsed.get("trigram_reason", f"卦象: {trigram}"),
         initial_yao=1,
         goal_progress_pct=parsed_pct,
         context=MingjueContextInfo(
@@ -335,8 +274,6 @@ async def _from_initial(
                 "models": str(wp.models),
                 "grids": str(wp.grids),
             },
-
-            suggested_grids=routing.get("suggested_grids", []),
         ),
     )
 
