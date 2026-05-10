@@ -87,12 +87,23 @@ nano.*.save
 .env.*
 !.env.example
 
+# Workspace data & runtime
+.vingobot/
+.taiji/
+memory/
+sessions/
+
 # Logs & temp
 *.log
 logs/
 tmp/
 temp/
 *.tmp
-.vingobot/
+tmp_*.txt
 nul
-tmp_diff.txt
+thinking
+enabled,
+
+# WSL / Windows startup scripts (workspace-specific)
+start-vingobot*
+wsl-*.sh

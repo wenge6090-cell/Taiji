@@ -74,7 +74,7 @@ def load_goal_context(goal_id: str) -> GoalContext | None:
             priority=meta.priority,
             self_driven=meta.self_driven.enabled,
         ),
-        blueprint_summary=_read_blueprint_summary(meta),
+        blueprint_summary=_read_blueprint_summary(goal_dir),
         memory_summary=_read_memory_summary(goal_dir),
         trajectory_snapshot=read_progress_snapshot(goal_id),
         recent_task_statuses=_read_recent_task_statuses(goal_dir),
@@ -90,9 +90,15 @@ def refresh_goal_context(goal_id: str) -> GoalContext | None:
 # Internal readers
 # ---------------------------------------------------------------------------
 
-def _read_blueprint_summary(meta: GoalMeta) -> str:
-    """Return the first 1000 characters of the goal's blueprint."""
-    return (meta.blueprint or "")[:1000]
+def _read_blueprint_summary(goal_dir: Path) -> str:
+    """Return the first 1000 characters of the goal's blueprint from blueprint.md."""
+    bp_file = goal_dir / "blueprint.md"
+    if not bp_file.is_file():
+        return ""
+    try:
+        return bp_file.read_text(encoding="utf-8")[:1000]
+    except OSError:
+        return ""
 
 
 def _read_memory_summary(goal_dir: Path) -> str:

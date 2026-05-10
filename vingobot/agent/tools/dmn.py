@@ -33,8 +33,11 @@ _ACTION_STATUS = "status"
 _ACTION_START = "start"
 _ACTION_STOP = "stop"
 _ACTION_TRIGGER = "trigger"
+_ACTION_ANALYZE = "analyze"
 
-_VALID_ACTIONS = frozenset({_ACTION_STATUS, _ACTION_START, _ACTION_STOP, _ACTION_TRIGGER})
+_VALID_ACTIONS = frozenset({
+    _ACTION_STATUS, _ACTION_START, _ACTION_STOP, _ACTION_TRIGGER, _ACTION_ANALYZE,
+})
 
 
 class DmnTool(Tool):
@@ -62,6 +65,11 @@ class DmnTool(Tool):
     * **trigger** — Manually enqueue a cognition-evolution task.
       The DMN consumer (if running) picks it up and the LLM evaluates
       whether to create or update skills, models, or grids.
+
+    * **analyze** — Cross-task execution analytics. Scans all goal/task
+      directories and aggregates round execution facts into a structured
+      ``ExecutionInsight`` report covering gua efficiency, tool failure
+      patterns, yin approval trends, and stuck-loop detection.
     """
 
     def __init__(self, loop: AgentLoop) -> None:
@@ -83,6 +91,8 @@ class DmnTool(Tool):
             "Use **start**/**stop** to control the background evolution loop. "
             "Use **trigger** to manually enqueue a cognition-evolution task "
             "(e.g. 'check whether we need a new HTTP skill'). "
+            "Use **analyze** to inspect cross-task execution patterns "
+            "(gua efficiency, tool failures, yin approval patterns, stuck loops). "
             "The DMN consumer runs independently of the sixiang goal-execution pool."
         )
 
@@ -124,6 +134,8 @@ class DmnTool(Tool):
                 return self._do_stop()
             if action == _ACTION_TRIGGER:
                 return self._do_trigger(kwargs)
+            if action == _ACTION_ANALYZE:
+                return await self._do_analyze()
         except Exception as exc:
             logger.exception("[DMN工具] 执行 '{}' 失败", action)
             return f"DMN 错误 ({action}): {exc}"
@@ -242,6 +254,300 @@ class DmnTool(Tool):
 
         except Exception as exc:
             return f"入队认知演化任务失败: {exc}"
+
+    # ------------------------------------------------------------------
+    # analyze — cross-task execution analytics
+    # ------------------------------------------------------------------
+
+    async def _do_analyze(self) -> str:
+        """Scan all goals/tasks, aggregate RoundExecutionFact data, and
+        produce an ``ExecutionInsight`` report."""
+        import json
+        from datetime import datetime, timezone
+
+        from vingobot.goal.types import (
+            CognitiveStat,
+            ExecutionInsight,
+            StuckLoopRecord,
+            ToolStatItem,
+            YinDecisionStat,
+        )
+
+        from vingobot.core.goal_meta import read_goal_meta
+        from vingobot.core.manifest import read_manifest
+        from vingobot.core.workspace import get_workspace_paths
+
+        wp = get_workspace_paths()
+        goals_dir = wp.goals
+
+        insight = ExecutionInsight(
+            generated_at=datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC"),
+        )
+
+        if not goals_dir.is_dir():
+            return "未找到 goal 目录，无法分析。"
+
+        # ── 读操作工具集（用于自读循环检测） ──────────────────────────
+        _READ_ONLY_TOOLS = frozenset({
+            "read_file", "search_codebase", "search_file",
+            "grep_code", "list_dir", "search_symbol",
+            "search_web", "fetch_content",
+        })
+
+        # ── 缓存一轮读过的 round 数据：{round_path: parsed_dict} ────
+        _round_cache: dict[str, dict | None] = {}
+
+        for goal_dir in sorted(goals_dir.iterdir()):
+            if not goal_dir.is_dir():
+                continue
+            goal_id = goal_dir.name
+            meta = read_goal_meta(goal_id)
+            if meta is None:
+                continue
+            insight.total_goals += 1
+
+            tasks_dir = goal_dir / "tasks"
+            if not tasks_dir.is_dir():
+                continue
+
+            for task_dir in sorted(tasks_dir.iterdir()):
+                if not task_dir.is_dir():
+                    continue
+
+                manifest = read_manifest(task_dir)
+                if manifest is None:
+                    continue
+
+                insight.total_tasks += 1
+                status = manifest.status
+                insight.task_status_breakdown[status] = (
+                    insight.task_status_breakdown.get(status, 0) + 1
+                )
+
+                # ── Read 06-execution-facts.json ───────────────────────
+                facts_path = task_dir / "06-execution-facts.json"
+                if not facts_path.is_file():
+                    continue
+
+                try:
+                    facts_data = json.loads(facts_path.read_text(encoding="utf-8"))
+                except (json.JSONDecodeError, OSError):
+                    continue
+
+                if not isinstance(facts_data, list):
+                    continue
+
+                outputs_dir = task_dir / "outputs"
+
+                # ── Aggregate per-round facts ──────────────────────────
+                for round_data in facts_data:
+                    if not isinstance(round_data, dict):
+                        continue
+
+                    insight.total_rounds += 1
+
+                    current_gua = str(round_data.get("current_gua", ""))
+                    sixiang = str(round_data.get("sixiang", ""))
+                    yao = round_data.get("yao", 0)
+                    exec_status = str(round_data.get("execution_status", "skipped"))
+                    tool_call_count = int(round_data.get("tool_call_count", 0))
+                    yin_decision = str(round_data.get("yin_decision", "skipped"))
+                    yin_reason = str(round_data.get("yin_reason", ""))
+
+                    is_success = exec_status == "success"
+                    is_failure = exec_status in ("failure", "exec_failed")
+
+                    # gua
+                    if current_gua:
+                        if current_gua not in insight.gua_stats:
+                            insight.gua_stats[current_gua] = CognitiveStat()
+                        gs = insight.gua_stats[current_gua]
+                        gs.count += 1
+                        gs.total_rounds += 1
+                        gs.total_tool_calls += tool_call_count
+                        if is_success:
+                            gs.success_count += 1
+                        if is_failure:
+                            gs.failure_count += 1
+
+                    # sixiang
+                    if sixiang:
+                        if sixiang not in insight.sixiang_stats:
+                            insight.sixiang_stats[sixiang] = CognitiveStat()
+                        ss = insight.sixiang_stats[sixiang]
+                        ss.count += 1
+                        ss.total_rounds += 1
+                        ss.total_tool_calls += tool_call_count
+                        if is_success:
+                            ss.success_count += 1
+                        if is_failure:
+                            ss.failure_count += 1
+
+                    # yao
+                    yao_key = str(yao)
+                    if yao_key and yao_key != "0":
+                        if yao_key not in insight.yao_stats:
+                            insight.yao_stats[yao_key] = CognitiveStat()
+                        ys = insight.yao_stats[yao_key]
+                        ys.count += 1
+                        ys.total_rounds += 1
+                        ys.total_tool_calls += tool_call_count
+                        if is_success:
+                            ys.success_count += 1
+                        if is_failure:
+                            ys.failure_count += 1
+
+                    # yin
+                    y = insight.yin_stats
+                    if yin_decision != "skipped":
+                        y.total += 1
+                        if yin_decision == "approved":
+                            y.approved += 1
+                        elif yin_decision == "rejected":
+                            y.rejected += 1
+                        elif yin_decision == "modified":
+                            y.modified += 1
+
+                        if yin_decision == "rejected" and yin_reason:
+                            reason_snippet = yin_reason[:60]
+                            found = False
+                            for i, (r, _) in enumerate(y.top_rejection_reasons):
+                                if r == reason_snippet:
+                                    cnt = y.top_rejection_reasons[i][1]
+                                    y.top_rejection_reasons[i] = (r, cnt + 1)
+                                    found = True
+                                    break
+                            if not found:
+                                y.top_rejection_reasons.append((reason_snippet, 1))
+
+                # ── Tool-level analysis + stuck-loop detection ───────
+                # (一次遍历所有 round 文件，避免重复读盘)
+                if outputs_dir.is_dir():
+                    consecutive_reads = 0
+                    stuck_rounds: list[int] = []
+
+                    round_files = sorted(
+                        outputs_dir.glob("*-round.json"),
+                        key=lambda x: int(x.name.split("-")[0])
+                        if x.name.split("-")[0].isdigit()
+                        else 0,
+                    )
+                    for rf in round_files:
+                        # Use cache to avoid re-reading
+                        cache_key = str(rf)
+                        if cache_key not in _round_cache:
+                            try:
+                                _round_cache[cache_key] = json.loads(
+                                    rf.read_text(encoding="utf-8")
+                                )
+                            except (json.JSONDecodeError, OSError):
+                                _round_cache[cache_key] = None
+                        rdata = _round_cache[cache_key]
+                        if not isinstance(rdata, dict):
+                            continue
+
+                        tool_calls = rdata.get("tool_calls") or rdata.get(
+                            "yang_tool_calls", []
+                        )
+                        if not isinstance(tool_calls, list):
+                            tool_calls = []
+                        results = rdata.get("execution_results", [])
+                        if not isinstance(results, list):
+                            results = []
+
+                        # ── Tool-level stats ────────────────────────
+                        for tc in tool_calls:
+                            if not isinstance(tc, dict):
+                                continue
+                            tname = tc.get("name") or tc.get(
+                                "function", {}
+                            ).get("name", "")
+                            if not tname:
+                                continue
+                            if tname not in insight.tool_stats:
+                                insight.tool_stats[tname] = ToolStatItem()
+                            insight.tool_stats[tname].call_count += 1
+
+                        for res in results:
+                            if not isinstance(res, dict):
+                                continue
+                            call_info = res.get("call", {})
+                            tname = (
+                                call_info.get("name", "")
+                                if isinstance(call_info, dict)
+                                else ""
+                            )
+                            status_val = str(res.get("status", ""))
+                            error = str(res.get("error", ""))
+
+                            if not tname:
+                                continue
+
+                            if tname not in insight.tool_stats:
+                                insight.tool_stats[tname] = ToolStatItem()
+                                insight.tool_stats[tname].call_count += 1
+
+                            ts = insight.tool_stats[tname]
+                            if status_val in ("error", "failure"):
+                                ts.failure_count += 1
+                                if len(error) > 3:
+                                    err_snip = error[:80]
+                                    new_errors = []
+                                    found = False
+                                    for err, cnt in ts.top_errors:
+                                        if err == err_snip:
+                                            new_errors.append(
+                                                (err, cnt + 1)
+                                            )
+                                            found = True
+                                        else:
+                                            new_errors.append((err, cnt))
+                                    if not found:
+                                        new_errors.append((err_snip, 1))
+                                    new_errors.sort(key=lambda x: -x[1])
+                                    ts.top_errors = new_errors[:5]
+                            if status_val == "exec_failed":
+                                ts.exec_failed_count += 1
+
+                        # ── Stuck-loop detection ─────────────────────
+                        if tool_calls:
+                            tnames = set()
+                            for tc in tool_calls:
+                                if isinstance(tc, dict):
+                                    tn = tc.get("name") or tc.get(
+                                        "function", {}
+                                    ).get("name", "")
+                                    if tn:
+                                        tnames.add(tn)
+
+                            if tnames and tnames.issubset(_READ_ONLY_TOOLS):
+                                # round number from filename
+                                round_num = int(rf.name.split("-")[0])
+                                consecutive_reads += 1
+                                stuck_rounds.append(round_num)
+                            else:
+                                consecutive_reads = 0
+                                stuck_rounds = []
+
+                    if consecutive_reads >= 3:
+                        rng = f"R{stuck_rounds[0]}-R{stuck_rounds[-1]}"
+                        insight.stuck_loops.append(
+                            StuckLoopRecord(
+                                goal_id=goal_id,
+                                task_id=task_dir.name,
+                                round_range=rng,
+                                consecutive_read_rounds=consecutive_reads,
+                                detection_reason=(
+                                    f"连续{consecutive_reads}轮仅读操作"
+                                ),
+                            )
+                        )
+                        insight.total_stuck_loops += 1
+
+        # Sort rejection reasons
+        insight.yin_stats.top_rejection_reasons.sort(key=lambda x: -x[1])
+
+        return insight.to_text()
 
     # ------------------------------------------------------------------
     # Helpers

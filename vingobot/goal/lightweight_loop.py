@@ -212,6 +212,17 @@ async def _run_lightweight_core(
         # 保存 Yang 的思考用于跨轮延续
         previous_yang_content = (yang_response.content or "")[:3000]
 
+        # ── 轮次输出持久化 ────────────────────────────────────
+        round_data: dict[str, Any] = {
+            "phase": agent_label,
+            "round": round_num,
+            "yang_content": yang_response.content,
+            "reasoning_content": yang_response.reasoning_content,
+            "thinking_blocks": yang_response.thinking_blocks,
+            "tool_calls": yang_response.tool_calls,
+            "called_task_complete": yang_response.called_task_complete,
+        }
+
         if yang_response.called_task_complete:
             # 始终优先 tool_call arguments（LLM 可能同时返回 text + tool_calls，
             # text 仅是推理文字，arguments 才是正式决策数据）
@@ -238,6 +249,7 @@ async def _run_lightweight_core(
             if not final_content:
                 final_content = yang_response.content or ""
             logger.info("[{}探索] 第 {} 轮 task_complete，收集到决策", agent_label, round_num)
+            _save_round_output(task_dir, agent_label, round_num, round_data)
             return LightweightLoopResult(
                 final_content=final_content,
                 rounds_executed=round_num,
@@ -246,6 +258,7 @@ async def _run_lightweight_core(
 
         if not yang_response.tool_calls:
             logger.debug("[{}探索] 第 {} 轮无工具调用，继续", agent_label, round_num)
+            _save_round_output(task_dir, agent_label, round_num, round_data)
             continue
 
         # ── 阴（审批）─────────────────────────────────────────
@@ -256,6 +269,9 @@ async def _run_lightweight_core(
 
         if not approved_calls:
             logger.debug("[{}探索] 第 {} 轮阴拒绝了所有调用", agent_label, round_num)
+            round_data["yin_decision"] = _yin_decision
+            round_data["yin_reason"] = _yin_reason
+            _save_round_output(task_dir, agent_label, round_num, round_data)
             continue
 
         # ── 执行器 ────────────────────────────────────────────
@@ -265,6 +281,18 @@ async def _run_lightweight_core(
             goal_dir=goal_dir,
             cognition_dirs=cognition_dirs,
         )
+
+        # 将执行结果追加到轮次数据并保存
+        round_data["yin_decision"] = _yin_decision
+        round_data["yin_reason"] = _yin_reason
+        round_data["approved_calls"] = [
+            {"name": c.name, "arguments": c.arguments} for c in approved_calls
+        ]
+        round_data["results"] = [
+            {"status": r.status, "output": r.output[:500], "error": r.error}
+            for r in results
+        ]
+        _save_round_output(task_dir, agent_label, round_num, round_data)
 
         # 收集本轮只读工具输出，注入下一轮
         previous_invoke_results = _format_prev_results(approved_calls, results)
@@ -350,3 +378,23 @@ def _format_prev_results(
         lines.append(output[:3000])
 
     return "\n\n".join(lines) if lines else ""
+
+
+def _save_round_output(task_dir: Path, agent_label: str, round_num: int, data: dict) -> None:
+    """保存单轮输出到 ``outputs/{label}-{round:03d}-round.json``。
+
+    与 task_inner_loop 的轮次文件保存路径相同，用 agent_label 前缀区分。
+    """
+    out_dir = task_dir / "outputs"
+    out_dir.mkdir(exist_ok=True)
+    # 将中文标签转换为安全的文件前缀
+    label_map = {"明觉": "mingjue", "暗驱": "anqu"}
+    prefix = label_map.get(agent_label, agent_label)
+    fn = f"{prefix}-{round_num:03d}-round.json"
+    try:
+        (out_dir / fn).write_text(
+            json.dumps(data, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+    except OSError:
+        logger.debug("[{}探索] 保存轮次输出失败: {}", agent_label, fn)

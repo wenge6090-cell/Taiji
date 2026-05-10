@@ -91,6 +91,20 @@ def _is_kimi_thinking_model(model_name: str) -> bool:
     return False
 
 
+def _is_deepseek_implicit_thinking_model(model_name: str) -> bool:
+    """Return True when model_name is a DeepSeek model that implicitly
+    requires ``reasoning_content`` in assistant messages even without an
+    explicit ``reasoning_effort`` parameter.
+
+    DeepSeek V4 and deepseek-reasoner always operate in thinking mode;
+    the API returns ``reasoning_content`` and expects it to be passed
+    back on subsequent turns regardless of whether the client sent a
+    ``thinking`` parameter.
+    """
+    model_lower = model_name.lower()
+    return any(token in model_lower for token in ("deepseek-v4", "deepseek-reasoner"))
+
+
 def _openai_compat_timeout_s() -> float:
     """Return the bounded request timeout used for OpenAI-compatible providers."""
     return _float_env("VINGOBOT_OPENAI_COMPAT_TIMEOUT_S", _OPENAI_COMPAT_REQUEST_TIMEOUT_S)
@@ -515,11 +529,19 @@ class OpenAICompatProvider(LLMProvider):
 
         GPT-5 family and reasoning models (o1/o3/o4) reject temperature
         when reasoning_effort is set to anything other than ``"none"``.
+        DeepSeek V4 / deepseek-reasoner always operate in thinking mode
+        and silently ignore both temperature and top_p.
         """
         if reasoning_effort and reasoning_effort.lower() != "none":
             return False
         name = model_name.lower()
-        return not any(token in name for token in ("gpt-5", "o1", "o3", "o4"))
+        if any(token in name for token in ("gpt-5", "o1", "o3", "o4")):
+            return False
+        # DeepSeek V4 / deepseek-reasoner always think internally;
+        # temperature has no effect. Suppress it for cleanliness.
+        if _is_deepseek_implicit_thinking_model(name):
+            return False
+        return True
 
     def _build_kwargs(
         self,
@@ -610,11 +632,22 @@ class OpenAICompatProvider(LLMProvider):
                 {"thinking": {"type": "enabled" if thinking_enabled else "disabled"}}
             )
 
+        # DeepSeek V4 / deepseek-reasoner always operate in thinking mode
+        # even without an explicit reasoning_effort. Explicitly send the
+        # ``thinking`` parameter to ensure consistent API behaviour.
+        # When ``disable_deepseek_thinking`` is True (the default), the
+        # parameter is sent as ``disabled``.
+        if reasoning_effort is None and _is_deepseek_implicit_thinking_model(model_name):
+            kwargs.setdefault("extra_body", {}).update(
+                {"thinking": {"type": "disabled" if self.generation.disable_deepseek_thinking else "enabled"}}
+            )
+
         if tools:
             kwargs["tools"] = tools
             kwargs["tool_choice"] = tool_choice or "auto"
 
-        if top_p is not None:
+        # DeepSeek V4 thinking mode ignores top_p; suppress it.
+        if top_p is not None and not _is_deepseek_implicit_thinking_model(model_name):
             kwargs["top_p"] = top_p
         # top_k / repetition_penalty are not standard OpenAI API parameters.
         # Route them via extra_body so provider backends that DO support them
@@ -638,15 +671,31 @@ class OpenAICompatProvider(LLMProvider):
         # mid-session. Injecting an empty string satisfies the API
         # without altering semantics (the model treats it as "no
         # thinking happened on that turn").
+        # NOTE: tool_call messages are excluded because they cannot
+        # legally carry both tool_calls AND reasoning_content in the
+        # same message — doing so confuses DeepSeek V4 and causes
+        # indefinite processing hangs.
         thinking_active = (
             (spec and spec.thinking_style and reasoning_effort is not None
              and semantic_effort not in ("none", "minimal"))
             or (reasoning_effort is not None and _is_kimi_thinking_model(model_name)
                 and semantic_effort not in ("none", "minimal"))
+            # DeepSeek V4 / deepseek-reasoner implicitly require
+            # reasoning_content even when reasoning_effort is not
+            # explicitly set, but ONLY when reasoning_effort was
+            # never provided (None), not when the user explicitly
+            # passed "none" or "minimal" to disable thinking.
+            or (reasoning_effort is None
+                and _is_deepseek_implicit_thinking_model(model_name)
+                and not self.generation.disable_deepseek_thinking)
         )
         if thinking_active:
             for msg in kwargs["messages"]:
-                if msg.get("role") == "assistant" and "reasoning_content" not in msg:
+                if (
+                    msg.get("role") == "assistant"
+                    and "reasoning_content" not in msg
+                    and not msg.get("tool_calls")  # skip tool_call messages
+                ):
                     msg["reasoning_content"] = ""
 
         # Merge user-configured extra_body last so it can override or

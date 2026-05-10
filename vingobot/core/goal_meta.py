@@ -46,9 +46,6 @@ class GoalMeta:
     rounds_completed: int = 0
     auto_managed: bool = True        # False = main-loop scanner skips this goal
 
-    # ── Blueprint (embedded, replaces standalone blueprint.md) ─────────
-    blueprint: str = ""
-
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> GoalMeta:
         sd = data.get("self_driven") or {}
@@ -69,7 +66,6 @@ class GoalMeta:
             warnings=list(data.get("warnings") or []),
             rounds_completed=int(data.get("rounds_completed", 0)),
             auto_managed=bool(data.get("auto_managed", True)),
-            blueprint=str(data.get("blueprint", "")),
         )
 
     def to_dict(self) -> dict[str, Any]:
@@ -89,7 +85,6 @@ class GoalMeta:
             "warnings": self.warnings,
             "rounds_completed": self.rounds_completed,
             "auto_managed": self.auto_managed,
-            "blueprint": self.blueprint,
         }
 
 

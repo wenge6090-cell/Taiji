@@ -15,6 +15,218 @@ from pathlib import Path
 
 from vingobot.goal.grid_types import CognitionEvolutionAction
 
+
+# ---------------------------------------------------------------------------
+# ExecutionInsight — aggregated cross-task analytics
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class CognitiveStat:
+    """Aggregated execution stats for a cognitive posture (gua/sixiang/yao)."""
+
+    count: int = 0
+    success_count: int = 0
+    failure_count: int = 0
+    total_rounds: int = 0
+    total_tool_calls: int = 0
+
+
+@dataclass
+class ToolStatItem:
+    """Per-tool execution statistics."""
+
+    call_count: int = 0
+    failure_count: int = 0
+    exec_failed_count: int = 0
+    top_errors: list[tuple[str, int]] = field(default_factory=list)
+
+
+@dataclass
+class YinDecisionStat:
+    """Aggregated Yin approval/denial patterns."""
+
+    total: int = 0
+    approved: int = 0
+    rejected: int = 0
+    modified: int = 0
+    top_rejection_reasons: list[tuple[str, int]] = field(default_factory=list)
+
+
+@dataclass
+class StuckLoopRecord:
+    """Record of a self-referential stuck loop detected across rounds."""
+
+    goal_id: str = ""
+    task_id: str = ""
+    round_range: str = ""
+    consecutive_read_rounds: int = 0
+    detection_reason: str = ""
+
+
+@dataclass
+class ExecutionInsight:
+    """Aggregated execution analytics across all sixiang goals/tasks.
+
+    Scans every goal's task directories, reads ``06-execution-facts.json``
+    and round output files, then produces structured statistics on:
+
+    - Cognitive posture effectiveness (gua/sixiang/yao)
+    - Tool execution success/failure patterns
+    - Yin approval/denial trends
+    - Self-referential stuck loop detection
+    """
+
+    generated_at: str = ""
+    total_goals: int = 0
+    total_tasks: int = 0
+    total_rounds: int = 0
+    task_status_breakdown: dict[str, int] = field(default_factory=dict)
+
+    # ── Per-cognitive-pattern stats ──────────────────────────────────────
+    gua_stats: dict[str, CognitiveStat] = field(default_factory=dict)
+    sixiang_stats: dict[str, CognitiveStat] = field(default_factory=dict)
+    yao_stats: dict[str, CognitiveStat] = field(default_factory=dict)
+
+    # ── Tool execution analysis ──────────────────────────────────────────
+    tool_stats: dict[str, ToolStatItem] = field(default_factory=dict)
+
+    # ── Yin approval analysis ────────────────────────────────────────────
+    yin_stats: YinDecisionStat = field(default_factory=YinDecisionStat)
+
+    # ── Self-referential loop detection ──────────────────────────────────
+    stuck_loops: list[StuckLoopRecord] = field(default_factory=list)
+    total_stuck_loops: int = 0
+
+    # ── Display ───────────────────────────────────────────────────────────
+
+    def to_text(self) -> str:
+        """Render as a human-readable analytics report."""
+
+        parts: list[str] = [
+            "# 🧠 六爻系统执行洞察\n",
+        ]
+
+        # ── Overview ─────────────────────────────────────────────────
+        parts.append("## 总览")
+        parts.append(f"- 目标数: {self.total_goals}")
+        parts.append(f"- 任务数: {self.total_tasks}")
+        parts.append(f"- 总轮数: {self.total_rounds}")
+        status_parts = [f"{k}={v}" for k, v in sorted(self.task_status_breakdown.items())]
+        if status_parts:
+            parts.append(f"- 任务状态分布: {', '.join(status_parts)}")
+        parts.append(f"- 检测到自读循环: {self.total_stuck_loops} 次")
+        parts.append("")
+
+        # ── Gua stats ────────────────────────────────────────────────
+        if self.gua_stats:
+            parts.append("## 卦象效率")
+            parts.append(f"| 卦象 | 次数 | 成功率 | 平均轮数 | 平均工具调用 |")
+            parts.append(f"|------|------|--------|----------|-------------|")
+            for gua, stat in sorted(
+                self.gua_stats.items(),
+                key=lambda x: -x[1].count,
+            ):
+                sr = stat.success_count / max(stat.count, 1) * 100
+                avg_r = stat.total_rounds / max(stat.count, 1)
+                avg_t = stat.total_tool_calls / max(stat.count, 1)
+                parts.append(
+                    f"| {gua} | {stat.count} | {sr:.0f}% | {avg_r:.1f} | {avg_t:.1f} |"
+                )
+            parts.append("")
+
+        # ── Sixiang stats ────────────────────────────────────────────
+        if self.sixiang_stats:
+            parts.append("## 四象模式")
+            parts.append(f"| 四象 | 次数 | 成功率 | 平均轮数 | 平均工具调用 |")
+            parts.append(f"|------|------|--------|----------|-------------|")
+            for sixiang, stat in sorted(
+                self.sixiang_stats.items(),
+                key=lambda x: -x[1].count,
+            ):
+                sr = stat.success_count / max(stat.count, 1) * 100
+                avg_r = stat.total_rounds / max(stat.count, 1)
+                avg_t = stat.total_tool_calls / max(stat.count, 1)
+                parts.append(
+                    f"| {sixiang} | {stat.count} | {sr:.0f}% | {avg_r:.1f} | {avg_t:.1f} |"
+                )
+            parts.append("")
+
+        # ── Yao stats ────────────────────────────────────────────────
+        if self.yao_stats:
+            parts.append("## 爻位分布")
+            parts.append(f"| 爻位 | 次数 | 成功率 | 平均轮数 | 平均工具调用 |")
+            parts.append(f"|------|------|--------|----------|-------------|")
+            for yao, stat in sorted(
+                self.yao_stats.items(),
+                key=lambda x: -x[1].count,
+            ):
+                sr = stat.success_count / max(stat.count, 1) * 100
+                avg_r = stat.total_rounds / max(stat.count, 1)
+                avg_t = stat.total_tool_calls / max(stat.count, 1)
+                parts.append(
+                    f"| {yao} | {stat.count} | {sr:.0f}% | {avg_r:.1f} | {avg_t:.1f} |"
+                )
+            parts.append("")
+
+        # ── Tool stats ───────────────────────────────────────────────
+        if self.tool_stats:
+            sorted_tools = sorted(
+                self.tool_stats.items(), key=lambda x: -x[1].call_count
+            )
+            total_calls = sum(s.call_count for _, s in sorted_tools)
+            total_fails = sum(s.failure_count for _, s in sorted_tools)
+            parts.append("## 工具执行分析")
+            parts.append(
+                f"- 总调用: {total_calls} | 总失败: {total_fails} "
+                f"({total_fails / max(total_calls, 1) * 100:.0f}%)"
+            )
+            parts.append("")
+            parts.append(f"| 工具 | 调用数 | 失败数 | 失败率 | 执行失败 |")
+            parts.append(f"|------|--------|--------|--------|----------|")
+            for name, stat in sorted_tools:
+                fr = stat.failure_count / max(stat.call_count, 1) * 100
+                parts.append(
+                    f"| {name} | {stat.call_count} | {stat.failure_count} | "
+                    f"{fr:.0f}% | {stat.exec_failed_count} |"
+                )
+            # Show top errors for tools with failures
+            for name, stat in sorted_tools:
+                if stat.top_errors:
+                    for err, count in stat.top_errors[:2]:
+                        parts.append(f"  - [{name}] `{err}` (×{count})")
+            parts.append("")
+
+        # ── Yin stats ───────────────────────────────────────────────
+        y = self.yin_stats
+        parts.append("## 阴（审批）模式")
+        parts.append(f"- 总审批决策: {y.total}")
+        if y.total > 0:
+            parts.append(f"- ✅ 批准: {y.approved} ({y.approved / y.total * 100:.0f}%)")
+            parts.append(f"- ❌ 拒绝: {y.rejected} ({y.rejected / y.total * 100:.0f}%)")
+            parts.append(f"- ✏️ 修改: {y.modified}")
+        if y.top_rejection_reasons:
+            parts.append("- 常见拒绝原因:")
+            for reason, cnt in y.top_rejection_reasons[:5]:
+                parts.append(f"  - `{reason}` (×{cnt})")
+        parts.append("")
+
+        # ── Stuck loops ─────────────────────────────────────────────
+        if self.stuck_loops:
+            parts.append("## 自读循环")
+            for sl in self.stuck_loops:
+                parts.append(
+                    f"- [{sl.goal_id}/{sl.task_id}] {sl.round_range}: "
+                    f"{sl.consecutive_read_rounds} 轮连续读操作 → {sl.detection_reason}"
+                )
+            parts.append("")
+
+        parts.append(f"---")
+        parts.append(f"生成时间: {self.generated_at}")
+
+        return "\n".join(parts)
+
+
 # ---------------------------------------------------------------------------
 # SixiangPermissionConfig — unified permission config for sixiang tools
 # ---------------------------------------------------------------------------

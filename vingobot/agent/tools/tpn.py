@@ -449,7 +449,6 @@ class TpnTool(Tool):
                 id=goal_id,
                 name=goal_id,
                 description=description,
-                blueprint=blueprint,
                 status="active",
                 priority=priority,
                 created_at=datetime.now(timezone.utc).isoformat(),

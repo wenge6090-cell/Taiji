@@ -202,7 +202,7 @@ def ensure_goal_dir(
     blueprint: str = "",
 ) -> Path:
     """Create a goal directory if it does not already exist, populating
-    ``meta.json`` (with embedded blueprint), ``memory/`` and ``tasks/``.
+    ``meta.json``, ``blueprint.md``, ``memory/``, ``tasks/``, and ``deliverables/``.
 
     Returns the resolved goal directory path.
     """
@@ -230,11 +230,14 @@ def ensure_goal_dir(
         "created_at": now,
         "last_active": now,
         "self_driven": {"enabled": False, "interval_minutes": 30},
-        "blueprint": blueprint,
     }
     (goal_dir / "meta.json").write_text(
         json.dumps(meta, ensure_ascii=False, indent=2), encoding="utf-8"
     )
+
+    # Write standalone blueprint.md
+    if blueprint:
+        (goal_dir / "blueprint.md").write_text(blueprint, encoding="utf-8")
 
     return goal_dir
 

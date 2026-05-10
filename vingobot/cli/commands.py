@@ -756,6 +756,7 @@ def serve(
 
     _tpn_bot = _vingobot(agent_loop)
     _tpn_bot._sixiang_cfg = runtime_config.agents.defaults.sixiang
+    _tpn_bot._config = runtime_config
     _tpn_bot._provider = provider
     agent_loop._tpn_bot = _tpn_bot
 
@@ -880,6 +881,7 @@ def _run_gateway(
 
     _tpn_bot = _vingobot(agent)
     _tpn_bot._sixiang_cfg = config.agents.defaults.sixiang
+    _tpn_bot._config = config
     _tpn_bot._provider = provider
     agent._tpn_bot = _tpn_bot
 
@@ -1176,6 +1178,16 @@ def _run_gateway(
         try:
             await cron.start()
             await heartbeat.start()
+
+            # Auto-start sixiang (六爻) worker pool if enabled
+            if config.agents.defaults.sixiang.enabled:
+                try:
+                    await _tpn_bot.start_sixiang()
+                    console.print(f"[green]✓[/green] Sixiang: 六爻协程池已启动 "
+                                  f"(workers={config.agents.defaults.sixiang.max_concurrent_workers})")
+                except Exception as exc:
+                    console.print(f"[yellow]⚠ Sixiang auto-start failed: {exc}[/yellow]")
+
             tasks = [
                 agent.run(),
                 channels.start_all(),
@@ -1277,6 +1289,7 @@ def agent(
 
     _tpn_bot = _vingobot(agent_loop)
     _tpn_bot._sixiang_cfg = config.agents.defaults.sixiang
+    _tpn_bot._config = config
     _tpn_bot._provider = provider
     agent_loop._tpn_bot = _tpn_bot
 

@@ -260,8 +260,9 @@ async def main() -> None:
         print(f"    状态: {meta.status}")
         print(f"    完成轮次: {meta.rounds_completed}")
         print(f"    最后暗驱: {meta.last_anqu_at}")
-        if meta.blueprint:
-            print(f"    蓝图: {meta.blueprint[:200]}...")
+        bp_file = Path(ws_path) / ".taiji" / "goals" / args.goal / "blueprint.md"
+        if bp_file.is_file():
+            print(f"    蓝图: {bp_file.read_text(encoding='utf-8')[:200]}...")
 
 
 if __name__ == "__main__":

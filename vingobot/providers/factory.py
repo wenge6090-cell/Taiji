@@ -95,6 +95,7 @@ def make_provider(config: Config, model: str | None = None) -> LLMProvider:
         temperature=defaults.temperature,
         max_tokens=defaults.max_tokens,
         reasoning_effort=defaults.reasoning_effort,
+        disable_deepseek_thinking=defaults.disable_deepseek_thinking,
     )
     return provider
 
@@ -118,6 +119,7 @@ def provider_signature(config: Config) -> tuple[object, ...]:
         defaults.temperature,
         defaults.reasoning_effort,
         defaults.context_window_tokens,
+        defaults.disable_deepseek_thinking,
     )
 
 
@@ -155,6 +157,7 @@ def build_sixiang_provider_snapshot(config: Config, agent_name: str) -> Provider
             temperature=temp,
             max_tokens=mt,
             reasoning_effort=re_effort,
+            disable_deepseek_thinking=provider.generation.disable_deepseek_thinking,
         )
 
     return ProviderSnapshot(

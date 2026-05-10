@@ -84,6 +84,7 @@ class GenerationSettings:
     temperature: float = 0.7
     max_tokens: int = 4096
     reasoning_effort: str | None = None
+    disable_deepseek_thinking: bool = True
 
 
 _SYNTHETIC_USER_CONTENT = "(conversation continued)"
