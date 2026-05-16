@@ -184,11 +184,6 @@ class DmnConsciousness:
         self._state_history: list[tuple[str, GuizangState]] = []
         """Recent state transitions for introspection (phase_name, state)."""
 
-        # ── 象语言守门验证 ────────────────────────────
-        self._xiang_vm: Any = None  # CangVM instance, lazy init
-        self._xiang_program_path: str | None = None
-        """Path to .xiang gatekeeper program for output validation."""
-
     # ------------------------------------------------------------------
     # Properties
     # ------------------------------------------------------------------
@@ -1409,71 +1404,6 @@ class DmnConsciousness:
     # ------------------------------------------------------------------
     # TPN feedback
     # ------------------------------------------------------------------
-
-    def set_output_validator(self, xiang_path: str) -> None:
-        """加载 .xiang 守门脚本用于输出验证。
-
-        Args:
-            xiang_path: .xiang 文件路径 (如 'vingobot/xiang/examples/守门人_验证.xiang')。
-        """
-        from vingobot.xiang.cang_vm import CangVM
-        self._xiang_program_path = xiang_path
-        self._xiang_vm = CangVM(quiet=True)
-        # Pre-load the program to verify it parses
-        self._xiang_vm.load_program(xiang_path)
-        logger.info("[DMN意识] 象语言守门验证已加载: {}", xiang_path)
-
-    def validate_output(
-        self, text: str, declared_gua: int = 0x3F,
-    ) -> "ChengshiResult | None":
-        """对 LLM 产出进行诚实验证。
-
-        Args:
-            text: LLM 的文本回复。
-            declared_gua: LLM 自声明的卦值 (默认 0x3F = 111111)。
-
-        Returns:
-            ChengshiResult 若验证器已加载，否则 None。
-        """
-        if self._xiang_vm is None:
-            return None
-
-        from vingobot.xiang.xiang_validator import verify_chengshi
-
-        origin_bits = self.origin.vector & 0x3F
-        result = verify_chengshi(
-            text=text,
-            declared_gua=declared_gua & 0x3F,
-            origin=origin_bits,
-        )
-
-        if not result.passed:
-            logger.warning(
-                "[DMN意识] 诚实验证失败: {} 声明={} 实际={} 差异={}",
-                result.verdict,
-                result.declared_str,
-                result.actual_str,
-                result.mismatch,
-            )
-            # 不诚实 → 藏海记录负面经验
-            self.cang_sea.add(CangSeaEntry(
-                state_from=self.state,
-                operator=QiOperator.SHA,
-                state_to=GuizangState(bits=0),
-                reward=-0.5,
-                summary=f"诚实验证失败: 差异{result.mismatch}位, {result.verdict}",
-                timestamp=datetime.now(timezone.utc).isoformat(),
-            ))
-            # 状态归零，对齐 C 行为
-            self.state = GuizangState(bits=0)
-        else:
-            logger.debug(
-                "[DMN意识] 诚实验证通过: 声明={} 实际={}",
-                result.declared_str,
-                result.actual_str,
-            )
-
-        return result
 
     def observe_tpn_task(self, success: bool, summary: str = "") -> None:
         """Receive feedback from a completed TPN task.
