@@ -25,6 +25,49 @@ from vingobot.goal.types import MingjueContextInfo, MingjueOutput, MingjueSource
 
 
 # ---------------------------------------------------------------------------
+# Grid skills lookup helper
+# ---------------------------------------------------------------------------
+
+
+def _lookup_grid_skills(trigram: str, grids_dir: Path) -> str:
+    """Look up skill names from grid JSONs matching the given trigram.
+
+    Returns a formatted markdown section listing available skills,
+    or an empty string if no skills are found.
+    """
+    if not grids_dir.is_dir():
+        return ""
+
+    for gf in sorted(grids_dir.glob("*.json")):
+        try:
+            data = json.loads(gf.read_text(encoding="utf-8"))
+            if data.get("trigram") != trigram:
+                continue
+            skills = data.get("skills", [])
+            skill_names: list[str] = []
+            for s in skills:
+                if isinstance(s, str):
+                    skill_names.append(s)
+                elif isinstance(s, dict):
+                    skill_names.append(s.get("name", ""))
+            skill_names = [n for n in skill_names if n]
+            if not skill_names:
+                return ""
+            skill_list = ", ".join(skill_names)
+            return (
+                f"## 认知资产——可用技能\n"
+                f"当前建议卦象 **{trigram}卦** 已预注入以下技能到 Worker 执行环境：\n"
+                f"- {skill_list}\n\n"
+                f"**请务必将技能名写入 concrete_goal 第一句中**，"
+                f"确保 Worker 看到任务描述就知道要先调用哪个技能。"
+            )
+        except (OSError, json.JSONDecodeError, ValueError):
+            continue
+
+    return ""
+
+
+# ---------------------------------------------------------------------------
 # Public API
 # ---------------------------------------------------------------------------
 
@@ -48,7 +91,7 @@ async def run_mingjue(
 
     # --- Continuation: Anqu already provided a concrete next step ---
     if source.type == "anqu_continuation":
-        return _from_continuation(goal_context, source)
+        return await _from_continuation(goal_context, source, signal)
 
     # --- Rework: re-examine the previous output ---
     if source.type == "rework":
@@ -63,15 +106,205 @@ async def run_mingjue(
 # ---------------------------------------------------------------------------
 
 
-def _from_continuation(goal_context: GoalContext, source: MingjueSource) -> MingjueOutput:
-    """Build a MingjueOutput from Anqu's structured continuation."""
+async def _from_continuation(
+    goal_context: GoalContext,
+    source: MingjueSource,
+    signal: asyncio.Task | None = None,
+) -> MingjueOutput:
+    """Build a MingjueOutput with SiBian (思变) — LLM-powered posture decision.
+
+    Unlike the old passthrough, this calls the LLM with full global context
+    (blueprint, memory, trajectory, Anqu's evaluation) so Mingjue can
+    exercise its SiBian function: adjusting trigram, refining the task
+    description, and assessing progress based on what actually happened.
+    """
+    wp = get_workspace_paths()
+    goal_dir_path = str(wp.goals / goal_context.goal_id)
+
+    blueprint_snippet = (
+        goal_context.blueprint_summary[:3000] if goal_context.blueprint_summary else "(无蓝图)"
+    )
+    memory_snippet = (
+        goal_context.memory_summary[:2000] if goal_context.memory_summary else "(无记忆)"
+    )
+    trajectory_snippet = (
+        goal_context.trajectory_snapshot[:2000] if goal_context.trajectory_snapshot else "(新目标)"
+    )
+    recent = goal_context.recent_task_statuses
+    recent_text = (
+        "\n".join(f"- {t.task_id}: {t.status} | {t.summary_snippet[:200]}" for t in recent)
+        if recent
+        else "(无近期任务)"
+    )
+
+    goal_file_listing = _list_goal_files(goal_dir_path)
+    phase1_text = _read_phase1(goal_dir_path)
+
+    # ── Anqu evaluation context ──────────────────────────────
+    anqu_lines: list[str] = ["## 暗驱（上爻）对上一任务的评估"]
+    if source.anqu_task_summary:
+        anqu_lines.append(f"- 上一任务完成情况: {source.anqu_task_summary[:500]}")
+    if source.anqu_reason:
+        anqu_lines.append(f"- 暗驱决策理由: {source.anqu_reason[:500]}")
+    if source.suggested_trigram:
+        anqu_lines.append(f"- 暗驱建议卦象: {source.suggested_trigram}")
+    if source.anqu_goal_progress_pct is not None:
+        anqu_lines.append(f"- 暗驱评估总体进度: {source.anqu_goal_progress_pct}%")
+    if source.previous_task_summary:
+        anqu_lines.append(f"- 上一任务摘要: {source.previous_task_summary[:300]}")
+    anqu_context = "\n".join(anqu_lines) if len(anqu_lines) > 1 else ""
+
+    # ── Next task hint from Anqu ─────────────────────────────
+    next_hint = source.description or source.continuation_context or "继续推进目标"
+
+    # ── Known traps ─────────────────────────────────────────
+    known_traps_section = goal_context.known_traps_text or ""
+
+    # ── Grid skills lookup for suggested trigram ──────────────
+    grid_skills_context = ""
+    suggested_trigram = source.suggested_trigram
+    if suggested_trigram:
+        grid_skills_context = _lookup_grid_skills(suggested_trigram, wp.grids)
+
+    system_prompt = f"""你是初爻·明觉，兼具"思变"之责。
+
+你的双重使命：
+1. **翻译** — 将暗驱的下一任务描述转化为具体可执行的指令
+2. **思变** — 基于目标全局状态和暗驱的评估结论，独立决策本轮任务的卦象和策略
+
+你可以使用以下探索能力在决策前收集信息：
+- list_directory / read_file — 查看目标目录、阶段报告、蓝图、记忆、认知库
+- query_capabilities — 了解执行环境能力
+
+认知库路径：
+- skills/ — L1 技能定义
+- models/ — L2 经验模型
+- grids/ — L3 认知格栅
+- truths/ — L4 不可变底层真理
+
+**快速决策优先**：当前上下文中已包含蓝图/记忆/轨迹/暗驱评估/文件清单等完整信息。
+最多探索 1 轮文件读取后必须调用 task_complete。
+
+## 当前目标上下文
+- 蓝图摘要: {blueprint_snippet}
+- 记忆摘要: {memory_snippet}
+- 轨迹快照: {trajectory_snippet}
+- 近期任务:
+{recent_text}
+
+{goal_file_listing}
+
+{phase1_text}
+
+{anqu_context}
+
+{known_traps_section}
+
+{grid_skills_context}
+
+## 暗驱指定的下一步
+{next_hint}
+
+## 思变决策指南
+你拥有独立判断权，可以不盲从暗驱的建议卦象。以下是你可以做的调整：
+- 暗驱建议了某个卦象，但你基于全局视野认为另一个卦象更合适 → **直接切换**
+- 连续多轮执行效率低下（轮次过多、纯读取多）→ 切换为更行动导向的卦象（如 震/zhen 或 坤/kun）
+- 上一任务产出质量高 → 可以保持或微调卦象，聚焦推进而非重复探索
+- 任务已接近目标完成 → 选择 兑/dui（总结交付）或 离/li（整理收尾）
+
+## 八卦路由表（根据任务性质选择一卦）
+- **qian**(乾/探索) — 需要大量搜索、学习的新任务
+- **kun**(坤/执行) — 明确的文件操作、批量修改
+- **zhen**(震/变革) — 代码修改、重构
+- **xun**(巽/分析) — 深入分析、问题定位
+- **kan**(坎/攻坚) — 疑难问题、调试
+- **li**(离/整理) — 文档、总结、整理
+- **gen**(艮/审视) — 只读分析、评估
+- **dui**(兑/沟通) — 生成报告、完成总结
+
+## 输出格式
+信息收集充分后，调用 task_complete，填入以下参数：
+- **summary** — 一句话总结本任务（纯文本）
+- **concrete_goal** — 详细的任务描述，包含期望成果和约束。
+  **重要**: 如果上方列出了可用技能，concrete_goal 的**第一句**必须包含 "使用 <skill名> 技能"（例如"使用 remotion-video 技能渲染视频"），确保 Worker 优先调用认知库技能而非从零搭建。
+- **trigram** — 选卦：qian|kun|zhen|xun|kan|li|gen|dui
+- **trigram_reason** — 选择此卦的理由（说明是否基于暗驱建议或独立决策）
+- **goal_progress_pct** — 目标整体完成百分比（0-100），基于暗驱评估和自身判断
+
+通过函数参数传入，不要包裹在额外的 markdown 代码块中。
+"""
+
+    mingjue_provider = _get_provider()
+    if mingjue_provider is None:
+        return _fallback_continuation(goal_context, source)
+
+    try:
+        from vingobot.goal.lightweight_loop import run_mingjue_loop
+
+        cognition_dirs = [
+            str(wp.skills),
+            str(wp.models),
+            str(wp.grids),
+        ]
+
+        result = await run_mingjue_loop(
+            task_dir=goal_dir_path,
+            system_prompt=system_prompt,
+            goal_dir=goal_dir_path,
+            cognition_dirs=cognition_dirs,
+            signal=signal,
+            provider=mingjue_provider,
+        )
+
+        if result.task_completed and result.final_content:
+            parsed = _parse_mingjue_json(result.final_content)
+        else:
+            logger.warning("[明觉/思变] 轻量循环未完成，使用透传回退")
+            return _fallback_continuation(goal_context, source)
+
+    except Exception:
+        logger.exception("[明觉/思变] 轻量探索循环失败，使用透传回退")
+        return _fallback_continuation(goal_context, source)
+
+    trigram = parsed.get("trigram", source.suggested_trigram or "kun")
+    raw_pct = parsed.get("goal_progress_pct")
+    if raw_pct is not None:
+        parsed_pct = _parse_progress_pct(raw_pct)
+    else:
+        parsed_pct = source.anqu_goal_progress_pct if source.anqu_goal_progress_pct is not None else 0
+
+    return MingjueOutput(
+        intent="task",
+        goal_id=goal_context.goal_id,
+        summary=parsed.get("summary") or source.description[:100],
+        concrete_goal=parsed.get("concrete_goal") or source.description,
+        trigram=trigram,
+        trigram_reason=parsed.get("trigram_reason", f"思变决策，卦象: {trigram}"),
+        initial_yao=1,
+        goal_progress_pct=parsed_pct,
+        context=MingjueContextInfo(
+            workspace_root=str(wp.root),
+            goal_dir=goal_dir_path,
+            cognition_dirs={
+                "skills": str(wp.skills),
+                "models": str(wp.models),
+                "grids": str(wp.grids),
+            },
+        ),
+    )
+
+
+def _fallback_continuation(
+    goal_context: GoalContext,
+    source: MingjueSource,
+) -> MingjueOutput:
+    """LLM-unavailable fallback — passthrough Anqu's output."""
     wp = get_workspace_paths()
 
-    # Use Anqu's suggested trigram if available, otherwise default to kun
     trigram = source.suggested_trigram or "kun"
     trigram_reason = (
-        f"暗驱续接，卦象: {trigram}" if source.suggested_trigram
-        else "暗驱续接，默认执行"
+        f"暗驱续接（回退），卦象: {trigram}" if source.suggested_trigram
+        else "暗驱续接（回退），默认执行"
     )
 
     return MingjueOutput(
@@ -173,6 +406,9 @@ async def _from_initial(
     goal_file_listing = _list_goal_files(goal_dir_path)
     phase1_text = _read_phase1(goal_dir_path)
 
+    # ── Known traps ─────────────────────────────────────────
+    known_traps_section = goal_context.known_traps_text or ""
+
     system_prompt = f"""你是初爻·明觉，负责将模糊目标翻译为具体可执行的任务。
 
 你可以使用以下探索能力在决策前收集信息：
@@ -198,6 +434,8 @@ async def _from_initial(
 {goal_file_listing}
 
 {phase1_text}
+
+{known_traps_section}
 
 ## 八卦路由表（根据任务性质选择一卦）
 - **qian**(乾/探索) — 需要大量搜索、学习的新任务

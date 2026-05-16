@@ -6,7 +6,7 @@ sixiang cycle:
 
     Mingjue → Task Inner Loop → Anqu → (repeat or terminate)
 
-The inner loop (Weaver → Yang → Yin → Executor) is delegated to
+The inner loop (Weaver → Yang → Yin) is delegated to
 ``task_inner_loop.py``.
 """
 
@@ -23,16 +23,19 @@ from vingobot.core.goal_context import GoalContext, load_goal_context, refresh_g
 from vingobot.core.goal_meta import read_goal_meta, update_goal_meta
 from vingobot.core.manifest import create_manifest, update_manifest_status
 from vingobot.core.trajectory import update_goal_progress
-from vingobot.core.workspace import create_task_folder, ensure_goal_dir
+from vingobot.core.workspace import create_task_folder, ensure_goal_dir, get_goal_dir
 from vingobot.goal.anqu import run_anqu
 from vingobot.goal.grid_types import CognitionEvolutionAction
 from vingobot.goal.mingjue import run_mingjue
+from vingobot.goal.sibian import run_sibian
 from vingobot.goal.task_inner_loop import InnerLoopResult, execute_task_inner_loop
 from vingobot.goal.types import (
     AnquAction,
+    AnquDecision,
     GoalResult,
     MingjueOutput,
     MingjueSource,
+    SibianDecision,
 )
 
 # Defaults
@@ -80,8 +83,10 @@ async def execute_complete_sixiang_loop(
     consecutive_continuations = 0  # track consecutive goal_next_task decisions
     goal_progress_history: list[int] = []  # track goal_progress_pct across tasks
     suggested_trigram = ""  # Anqu's suggested gua for next task
-
-    _REFLECTION_INTERVAL = 3  # force LLM re-assessment every N continuations
+    anqu_task_summary = ""  # Anqu's summary of previous task (for 思变)
+    anqu_reason = ""  # Anqu's routing reason (for 思变)
+    anqu_goal_progress_pct: int | None = None  # Anqu's progress assessment (for 思变)
+    stagnation_attempts = 0  # blueprint review attempts after stagnation detection
 
     while task_count < max_goal_tasks:
         if signal is not None and signal.cancelled():
@@ -103,25 +108,16 @@ async def execute_complete_sixiang_loop(
         if mode == "initial":
             source = MingjueSource(type="initial_goal", description=task_description)
         elif mode == "continuation":
-            # Periodic reflection: force LLM re-assessment every N continuations
-            if consecutive_continuations >= _REFLECTION_INTERVAL:
-                source = MingjueSource(
-                    type="periodic_reflection",
-                    description=task_description,
-                    previous_task_summary=previous_task_summary,
-                    continuation_context=continuation_context,
-                    suggested_trigram=suggested_trigram,
-                )
-                consecutive_continuations = 0
-                goal_progress_history = []  # 同步重置，反射后重新计数
-            else:
-                source = MingjueSource(
-                    type="anqu_continuation",
-                    description=task_description,
-                    previous_task_summary=previous_task_summary,
-                    continuation_context=continuation_context,
-                    suggested_trigram=suggested_trigram,
-                )
+            source = MingjueSource(
+                type="anqu_continuation",
+                description=task_description,
+                previous_task_summary=previous_task_summary,
+                continuation_context=continuation_context,
+                suggested_trigram=suggested_trigram,
+                anqu_task_summary=anqu_task_summary,
+                anqu_reason=anqu_reason,
+                anqu_goal_progress_pct=anqu_goal_progress_pct,
+            )
         else:
             source = MingjueSource(
                 type="rework",
@@ -187,6 +183,127 @@ async def execute_complete_sixiang_loop(
             "suggested_trigram": anqu_decision.suggested_trigram or "",
         })
 
+        # ── 暗驱已知陷阱提案 → 写入待确认文件 ──────────────────
+        if anqu_decision.known_traps_proposal:
+            _write_pending_traps(goal_id, task_id, anqu_decision.known_traps_proposal)
+
+        # ── 3.5 learn_task → DMN 认知演化 ──────────────────
+        if anqu_decision.action == "learn_task":
+            logger.info("[六爻] learn_task → 路由到 DMN 认知演化")
+            # Create a default precipitate skill action if Anqu didn't provide one
+            evolution = list(anqu_decision.evolution_actions) if anqu_decision.evolution_actions else []
+            if not evolution:
+                from vingobot.goal.grid_types import CognitionEvolutionAction
+                evolution = [
+                    CognitionEvolutionAction(
+                        action="precipitate_skill",
+                        target_name=f"task_experience_{task_id}",
+                        description=f"沉淀任务 {task_id} 的执行经验为可复用技能",
+                        priority=5,
+                    )
+                ]
+            _process_evolution_actions(evolution, task_id, inner_result=inner_result, task_dir=str(task_dir))
+            # Treat as task completed, route to goal_next_task
+            anqu_decision = AnquDecision(
+                action="goal_next_task",
+                task_summary=anqu_decision.task_summary,
+                next_task_description=anqu_decision.next_task_description or task_description,
+                goal_progress_pct=anqu_decision.goal_progress_pct,
+                suggested_trigram=anqu_decision.suggested_trigram,
+                continuation_context=anqu_decision.continuation_context,
+            )
+
+        # ── 3.6 回炉子循环 ────────────────────────────────────
+        # 暗驱要求继续/验证 → 同目录重启内循环，不创建新任务文件夹
+        _MAX_REWORK_ATTEMPTS = 5
+        rework_attempt = 0
+
+        while anqu_decision.action in ("continue_task", "verify_task"):
+            rework_attempt += 1
+            if rework_attempt > _MAX_REWORK_ATTEMPTS:
+                logger.warning(
+                    "[六爻] 回炉达上限 ({} 次)，强制终止任务 {}",
+                    _MAX_REWORK_ATTEMPTS, task_id,
+                )
+                anqu_decision = AnquDecision(
+                    action="goal_failed",
+                    task_summary=anqu_decision.task_summary,
+                    failure_reason=f"回炉 {_MAX_REWORK_ATTEMPTS} 次后仍无法完成，强制终止",
+                )
+                break
+
+            # ── 写入暗驱指令文件 ────────────────────────────
+            _write_anqu_instruction(
+                task_dir, anqu_decision, rework_attempt, inner_result=inner_result,
+            )
+
+            # ── 更新 manifest 状态 ───────────────────────────
+            rework_status_map = {
+                "continue_task": "in_progress",
+                "verify_task": "verifying",
+            }
+            update_manifest_status(
+                task_dir,
+                status=rework_status_map[anqu_decision.action],
+            )
+
+            logger.info(
+                "[六爻] 回炉 #{}/{}: {} → {} (指令已写入 05-anqu-instruction.md)",
+                rework_attempt, _MAX_REWORK_ATTEMPTS,
+                task_id, anqu_decision.action,
+            )
+
+            # ── 同目录重启内循环 ─────────────────────────────
+            inner_result = await execute_task_inner_loop(
+                task_dir=task_dir,
+                mingjue_output=mingjue_output,
+                goal_context=goal_context,
+                signal=signal,
+                max_rounds=max_rounds + max_rework_rounds,
+                rework_attempt=rework_attempt,
+                rework_action=anqu_decision.action,
+            )
+            total_rounds += inner_result.rounds_executed
+
+            # ── 更新 manifest ─────────────────────────────────
+            update_manifest_status(
+                task_dir,
+                "completed" if inner_result.task_completed else "failed",
+                round_count=inner_result.rounds_executed,
+            )
+
+            # ── 再次运行暗驱评估 ─────────────────────────────
+            anqu_decision = await run_anqu(
+                goal_context=goal_context,
+                current_task_facts=inner_result.facts,
+                final_content=inner_result.final_content,
+                task_dir=str(task_dir),
+                signal=signal,
+                cognitive_usage=inner_result.cognitive_usage,
+                total_tasks=task_count,
+                mingjue_progress_pct=mingjue_progress,
+            )
+
+            # ── 回炉记忆持久化 ───────────────────────────────
+            _persist_memory(goal_id, task_id, "anqu_rework", {
+                "action": anqu_decision.action,
+                "rework_attempt": rework_attempt,
+                "what_was_accomplished": (anqu_decision.task_summary or "")[:300],
+                "goal_progress_pct": anqu_decision.goal_progress_pct,
+                "reason": (anqu_decision.continuation_context or anqu_decision.rework_instruction or "")[:300],
+            })
+
+            # ── 处理认知演化动作 ─────────────────────────────
+            _process_evolution_actions(
+                anqu_decision.evolution_actions,
+                task_id,
+                inner_result=inner_result,
+                task_dir=str(task_dir),
+            )
+
+        # ── 交付物自动聚拢 ──────────────────────────────────────
+        _link_task_deliverables(str(task_dir), goal_id)
+
         # ── 总进度写入 ──────────────────────────────────────────
         _task_status = "completed" if inner_result.task_completed else "failed"
         if inner_result is not None and inner_result.final_content and "自读循环" in inner_result.final_content:
@@ -246,6 +363,74 @@ async def execute_complete_sixiang_loop(
             )
 
         if action == "goal_failed":
+            # ── 思变救援机会: 暗驱打算放弃,但在执行前给思变一次介入机会 ──
+            # 当 needs_sibian=True (连续失败/任务数高/已知陷阱),思变可提供替代策略
+            if anqu_decision.needs_sibian:
+                sibian_decision = await run_sibian(
+                    goal_context=goal_context,
+                    anqu_decision=anqu_decision,
+                    total_tasks=task_count,
+                    goal_progress_history=goal_progress_history,
+                    signal=signal,
+                )
+                _save_sibian_decision(goal_id, task_id, sibian_decision)
+
+                # 思变给出了救援策略(非 abort 非 continue)→覆盖失败决策,继续推进
+                if sibian_decision.action not in ("abort", "continue"):
+                    task_description = anqu_decision.next_task_description or task_description
+                    mode = "continuation"
+                    previous_task_summary = anqu_decision.task_summary or ""
+                    continuation_context = anqu_decision.continuation_context or ""
+                    suggested_trigram = anqu_decision.suggested_trigram or ""
+
+                    # ── 注入思变策略到明觉上下文 ─────────────────
+                    strategy_text = sibian_decision.strategy or sibian_decision.reason or ""
+                    if strategy_text:
+                        action_labels = {
+                            "push_through": "🚀 强攻突破",
+                            "navigate_around": "🧭 绕行换路",
+                            "wait_gather": "⏳ 主动等待",
+                            "decompose": "📐 拆解降维",
+                            "escalate": "🆘 升级求助",
+                            "continue": "➡️ 照常推进",
+                        }
+                        label = action_labels.get(sibian_decision.action, "思变决策(目标失败救援)")
+                        continuation_context += (
+                            f"\n\n## {label}\n"
+                            f"思变节点连山分析（目标失败救援）：\n"
+                            f"- 六气: {sibian_decision.liuq}\n"
+                            f"- 六甲: {sibian_decision.liujia}\n"
+                            f"- 对峙: {sibian_decision.duizhi}\n"
+                            f"- 策略: {strategy_text}\n"
+                            f"- 时机: {sibian_decision.timing}\n"
+                        )
+
+                    # ── 卦象建议 ─────────────────────────────
+                    if sibian_decision.trigram_hint:
+                        suggested_trigram = sibian_decision.trigram_hint
+
+                    # ── 蓝图微调（navigate_around / decompose 时可选） ──
+                    if sibian_decision.blueprint_revision and sibian_decision.action in ("navigate_around", "decompose"):
+                        _apply_blueprint_revision(goal_id, sibian_decision.blueprint_revision)
+                        continuation_context += (
+                            f"\n\n## 🔄 蓝图微调\n"
+                            f"思变节点对蓝图的任务拆解/顺序进行了调整：\n"
+                            f"{sibian_decision.blueprint_revision[:500]}\n"
+                        )
+
+                    logger.info(
+                        "[六爻] 思变救援: 暗驱 goal_failed → 思变 {} → 覆盖为续行",
+                        sibian_decision.action,
+                    )
+                    goal_context = refresh_goal_context(goal_id)
+                    continue
+
+                # 思变也同意放弃 → 执行暗驱的失败决策
+                logger.info(
+                    "[六爻] 思变确认放弃: 暗驱 goal_failed → 思变 {} → 执行终止",
+                    sibian_decision.action,
+                )
+
             update_goal_meta(goal_id, status="failed")
             return GoalResult(
                 status="failed",
@@ -274,24 +459,57 @@ async def execute_complete_sixiang_loop(
             # ── 链深度追踪 ──────────────────────────────────
             consecutive_continuations += 1
 
-            # ── 滞涨检测: 连续3个任务进度未增长 → 终止 ────
+            # ── 滞涨检测: 两阶段 ─────────────────────────
             pct = anqu_decision.goal_progress_pct if anqu_decision.goal_progress_pct is not None else mingjue_progress
             if pct is not None:
                 goal_progress_history.append(pct)
+                _stagnation_warning = ""  # captured here, injected after variable assignments
                 if len(goal_progress_history) >= 3:
                     last3 = goal_progress_history[-3:]
                     if max(last3) - min(last3) <= 5:
-                        update_goal_meta(goal_id, status="completed")
-                        return GoalResult(
-                            status="completed",
-                            goal_id=goal_id,
-                            reason=f"连续 {len(goal_progress_history)} 个任务目标进度停滞 ({last3})，自动终止",
+                        stagnation_attempts += 1
+                        if stagnation_attempts >= 2:
+                            # Stage 2: DMN review already attempted, still stuck → terminate
+                            update_goal_meta(goal_id, status="completed")
+                            return GoalResult(
+                                status="completed",
+                                goal_id=goal_id,
+                                reason=(
+                                    f"连续 {len(goal_progress_history)} 个任务目标进度停滞 ({last3})，"
+                                    f"已触发 {stagnation_attempts - 1} 次蓝图重审，仍无进展，自动终止"
+                                ),
+                            )
+                        # Stage 1: trigger DMN blueprint review, reset, continue
+                        logger.warning(
+                            "[六爻] 滞涨检测 (第 {} 次): 连续 {} 个任务进度停滞 {} → 触发 DMN 蓝图重审",
+                            stagnation_attempts, len(goal_progress_history), last3,
                         )
+                        _trigger_blueprint_review(
+                            goal_id=goal_id,
+                            task_id=task_id,
+                            stagnation_history=goal_progress_history,
+                        )
+                        # Capture warning text — inject AFTER variable assignments below
+                        _stagnation_warning = (
+                            f"## ⚠️ 滞涨警告（第 {stagnation_attempts} 次）\n"
+                            f"连续 {len(goal_progress_history)} 个任务的目标进度在 {last3} 之间停滞。"
+                            f"已触发 DMN 蓝图重审任务。请考虑：\n"
+                            f"- 当前任务拆解方式是否合理？\n"
+                            f"- 是否需要更换策略方向？\n"
+                            f"- 目标判定标准是否需要调整？\n"
+                        )
+                        goal_progress_history = []  # reset for fresh measurement after review
 
             task_description = anqu_decision.next_task_description or task_description
             mode = "continuation"
             previous_task_summary = anqu_decision.task_summary or ""
             continuation_context = anqu_decision.continuation_context or ""
+            # ── 滞涨警告注入（在变量赋值之后，避免被覆盖）───
+            if _stagnation_warning:
+                continuation_context = _stagnation_warning + "\n" + continuation_context
+            anqu_task_summary = anqu_decision.task_summary or ""
+            anqu_reason = anqu_decision.continuation_context or anqu_decision.rework_instruction or ""
+            anqu_goal_progress_pct = anqu_decision.goal_progress_pct
             # ── 注入第一步具体行动 ────────────────────────────
             if anqu_decision.next_task_concrete_action:
                 continuation_context += (
@@ -299,18 +517,72 @@ async def execute_complete_sixiang_loop(
                 )
             # ── 传递卦象建议 ────────────────────────────────
             suggested_trigram = anqu_decision.suggested_trigram or ""
-            goal_context = refresh_goal_context(goal_id)
+
+            # ── 5. 五爻·思变 (连山策略引擎) ─────────────────
+            # 暗驱触发：仅当 Anqu 检测到跨任务停滞/失败模式时运行
+            if anqu_decision.needs_sibian:
+                sibian_decision = await run_sibian(
+                    goal_context=goal_context,
+                    anqu_decision=anqu_decision,
+                    total_tasks=task_count,
+                    goal_progress_history=goal_progress_history,
+                    signal=signal,
+                )
+                _save_sibian_decision(goal_id, task_id, sibian_decision)
+
+                if sibian_decision.action == "abort":
+                    update_goal_meta(goal_id, status="failed")
+                    return GoalResult(
+                        status="failed",
+                        goal_id=goal_id,
+                        reason=f"思变节点终止: {sibian_decision.reason}",
+                    )
+
+                # ── 注入思变策略到明觉上下文 ─────────────────
+                strategy_text = sibian_decision.strategy or sibian_decision.reason or ""
+                if strategy_text:
+                    action_labels = {
+                        "push_through": "🚀 强攻突破",
+                        "navigate_around": "🧭 绕行换路",
+                        "wait_gather": "⏳ 主动等待",
+                        "decompose": "📐 拆解降维",
+                        "escalate": "🆘 升级求助",
+                        "continue": "➡️ 照常推进",
+                    }
+                    label = action_labels.get(sibian_decision.action, "思变决策")
+                    continuation_context += (
+                        f"\n\n## {label}\n"
+                        f"思变节点连山分析：\n"
+                        f"- 六气: {sibian_decision.liuq}\n"
+                        f"- 六甲: {sibian_decision.liujia}\n"
+                        f"- 对峙: {sibian_decision.duizhi}\n"
+                        f"- 策略: {strategy_text}\n"
+                        f"- 时机: {sibian_decision.timing}\n"
+                    )
+
+                # ── 卦象建议 ─────────────────────────────
+                if sibian_decision.trigram_hint:
+                    suggested_trigram = sibian_decision.trigram_hint
+
+                # ── 蓝图微调（navigate_around / decompose 时可选） ──
+                if sibian_decision.blueprint_revision and sibian_decision.action in ("navigate_around", "decompose"):
+                    _apply_blueprint_revision(goal_id, sibian_decision.blueprint_revision)
+                    continuation_context += (
+                        f"\n\n## 🔄 蓝图微调\n"
+                        f"思变节点对蓝图的任务拆解/顺序进行了调整：\n"
+                        f"{sibian_decision.blueprint_revision[:500]}\n"
+                    )
+
+                # ── 上下文刷新 ──────────────────────────
+                if sibian_decision.timing == "after_refresh":
+                    logger.info("[六爻] 思变建议 after_refresh，刷新目标上下文")
+                goal_context = refresh_goal_context(goal_id)
+            else:
+                goal_context = refresh_goal_context(goal_id)
+
             continue
 
-        if action in ("continue_task", "verify_task", "learn_task"):
-            rework_instruction = anqu_decision.rework_instruction or "请重新审题并继续执行"
-            # ── 注入执行诊断信息 ──────────────────────────────
-            diagnostics = _build_rework_diagnostics(inner_result.facts)
-            if diagnostics:
-                rework_instruction += "\n\n" + diagnostics
-            mode = "rework"
-            continue
-
+        # ── If still in rework after max attempts → was caught above as goal_failed
         logger.warning("[六爻] 未知暗驱动作: {}", action)
         break
 
@@ -396,6 +668,88 @@ def _build_rework_diagnostics(facts: list) -> str:
     return "\n".join(lines)
 
 
+def _write_anqu_instruction(
+    task_dir: Path,
+    anqu_decision: AnquDecision,
+    rework_attempt: int,
+    *,
+    inner_result: InnerLoopResult | None = None,
+) -> None:
+    """Write 05-anqu-instruction.md into the task directory for Yang to read on restart.
+
+    Yang reads this file on the first round of a rework cycle to understand
+    the specific goal (continue / verify / learn) without needing Mingjue.
+    """
+    from datetime import datetime, timezone
+
+    task_dir = Path(task_dir)
+    action = anqu_decision.action
+    instruction_text = anqu_decision.rework_instruction or anqu_decision.continuation_context or ""
+
+    action_label = {
+        "continue_task": "继续执行",
+        "verify_task": "验证产出",
+        "learn_task": "沉淀经验",
+    }.get(action, action)
+
+    lines = [
+        f"# 暗驱回炉指令",
+        f"",
+        f"- **生成时间**: {datetime.now(timezone.utc).isoformat()}",
+        f"- **回炉次数**: 第 {rework_attempt} 次",
+        f"- **回炉类型**: {action}（{action_label}）",
+        f"",
+        f"## 暗驱评估",
+        f"",
+        f"{anqu_decision.task_summary or '(无)'}",
+        f"",
+        f"## 具体指令",
+        f"",
+        f"{instruction_text or '请继续推进任务。'}",
+        f"",
+        f"## 执行要求",
+        f"",
+    ]
+
+    if action == "verify_task":
+        lines.extend([
+            f"- 你需要**验证上一轮产出物的正确性**，而不是创建新文件。",
+            f"- 优先使用 exec 运行验证脚本（如 ffprobe、pytest、python 脚本检查）。",
+            f"- exec 运行失败是预期行为——它暴露了问题，不要因为 exec 返回非零就放弃。",
+            f"- 如果 exec 验证成功，用 task_complete 上报验证结果。",
+            f"- 如果 exec 验证失败，用 edit_file 修复产出物后再次 exec 验证。",
+            f"- **不要**写新文件来替代旧产出——编辑修复已有的文件。",
+        ])
+    elif action == "continue_task":
+        # Inject diagnostics from previous execution
+        if inner_result is not None:
+            diagnostics = _build_rework_diagnostics(inner_result.facts)
+            if diagnostics:
+                lines.append(diagnostics)
+                lines.append("")
+        lines.extend([
+            f"- 上一轮任务未完成，请在同一目录下继续工作。",
+            f"- 首先检查 outputs/ 目录中已有的产出物。",
+            f"- 优先用 edit_file 修复已有文件，而不是创建新文件。",
+            f"- 如果确实需要新文件，确保是推进任务的必要产出。",
+        ])
+    elif action == "learn_task":
+        lines.extend([
+            f"- 上一轮任务已完成，现在需要提炼经验为可复用的认知资产。",
+            f"- 回顾 outputs/ 目录中的产出物和执行路径。",
+            f"- 用 write_file 创建 L1 技能 (SKILL.md) 或 L2 模型文件。",
+            f"- 产出物写入目标 deliverable/ 目录或认知库目录。",
+        ])
+
+    try:
+        (task_dir / "05-anqu-instruction.md").write_text(
+            "\n".join(lines), encoding="utf-8",
+        )
+        logger.info("[六爻] 写入暗驱指令: {}", task_dir / "05-anqu-instruction.md")
+    except OSError as exc:
+        logger.error("[六爻] 写入暗驱指令失败: {}", exc)
+
+
 def _persist_memory(
     goal_id: str,
     task_id: str,
@@ -428,6 +782,67 @@ def _persist_memory(
         logger.debug("[六爻] 写入{}记忆: {}", entry_type, path)
     except OSError:
         logger.warning("[六爻] 写入{}记忆失败: {}", entry_type, path)
+
+
+def _apply_blueprint_revision(goal_id: str, revision_content: str) -> None:
+    """Apply a blueprint revision from Sibian to the goal's blueprint file.
+
+    Writes to ``<goal_dir>/blueprint.md``.  Also creates a revision history entry
+    at ``<goal_dir>/blueprint-revisions/`` for audit.
+    """
+    from vingobot.core.workspace import get_goal_dir
+
+    goal_dir = get_goal_dir(goal_id)
+    bp_file = goal_dir / "blueprint.md"
+    try:
+        bp_file.write_text(revision_content, encoding="utf-8")
+        logger.info("[六爻] 思变修订蓝图: {}", bp_file)
+
+        # ── 记录修订历史 ───────────────────────────────────
+        rev_dir = goal_dir / "blueprint-revisions"
+        rev_dir.mkdir(parents=True, exist_ok=True)
+        rev_file = rev_dir / f"sibian-revision-{datetime.now(timezone.utc).strftime('%Y%m%d-%H%M%S')}.md"
+        rev_file.write_text(revision_content, encoding="utf-8")
+    except OSError as exc:
+        logger.error("[六爻] 写入蓝图修订失败: {}", exc)
+
+
+def _save_sibian_decision(goal_id: str, task_id: str, decision: SibianDecision) -> None:
+    """Persist Sibian's Lianshan decision to ``<goal_dir>/sibian/`` for audit / review.
+
+    Saves the full SibianDecision (action, liuq, liujia, sanyuan, duizhi,
+    strategy, trigram_hint, timing, reason, blueprint_revision) as JSON.
+    """
+    from vingobot.core.workspace import get_goal_dir
+
+    goal_dir = get_goal_dir(goal_id)
+    sibian_dir = goal_dir / "sibian"
+    sibian_dir.mkdir(parents=True, exist_ok=True)
+
+    data = {
+        "task_id": task_id,
+        "action": decision.action,
+        "reason": decision.reason,
+        "strategy": decision.strategy,
+        "liuq": decision.liuq,
+        "liujia": decision.liujia,
+        "sanyuan": decision.sanyuan,
+        "duizhi": decision.duizhi,
+        "trigram_hint": decision.trigram_hint,
+        "timing": decision.timing,
+        "blueprint_revision": decision.blueprint_revision,
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+    }
+
+    path = sibian_dir / f"sibian-decision-{task_id}.json"
+    try:
+        path.write_text(
+            json.dumps(data, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+        logger.debug("[六爻] 保存思变决策: {}", path)
+    except OSError:
+        logger.warning("[六爻] 保存思变决策失败: {}", path)
 
 
 def _process_evolution_actions(
@@ -487,6 +902,62 @@ def _process_evolution_actions(
         logger.warning("[六爻] 处理认知演化动作失败: {}", exc)
 
 
+def _trigger_blueprint_review(
+    goal_id: str,
+    task_id: str,
+    stagnation_history: list[int],
+) -> None:
+    """Enqueue a DMN blueprint review task when stagnation is detected.
+
+    Creates a high-priority ``review_blueprint`` cognition evolution task
+    that asks DMN to re-examine the blueprint, trajectory, and execution
+    history to decide whether the goal needs re-scoping, re-decomposition,
+    or should be declared blocked.
+    """
+    try:
+        from vingobot.core.workspace import get_workspace_paths
+        from vingobot.goal.grid_types import CognitionEvolutionAction
+
+        wp = get_workspace_paths()
+        pending_dir = wp.pending
+        pending_dir.mkdir(parents=True, exist_ok=True)
+
+        action = CognitionEvolutionAction(
+            action="review_blueprint",
+            target_name=f"goal_{goal_id}_blueprint",
+            description=(
+                f"目标 {goal_id} 连续 {len(stagnation_history)} 个任务进度停滞在 "
+                f"{stagnation_history}，需要重审蓝图。请分析："
+                f"1) 目标拆解是否合理 2) 当前策略是否有效 "
+                f"3) 是否需要修改完成判定标准 4) 是否应该标记为 blocked"
+            ),
+            source_task_id=task_id,
+            source_goal_id=goal_id,
+            priority=9,  # highest priority — blocked goal needs immediate attention
+            context={"stagnation_history": stagnation_history},
+        )
+
+        filename = (
+            f"cognition-evolution__09__"
+            f"review_blueprint__goal_{goal_id}_blueprint__"
+            f"{datetime.now(timezone.utc).strftime('%Y%m%d-%H%M%S')}.task"
+        )
+
+        task_file = pending_dir / filename
+        task_desc = _build_evolution_task_description(action)
+        task_file.write_text(task_desc, encoding="utf-8")
+
+        logger.info(
+            "[六爻] 入队蓝图重审任务: goal={} stagnation_rounds={} history={}",
+            goal_id,
+            len(stagnation_history),
+            stagnation_history,
+        )
+
+    except Exception as exc:
+        logger.warning("[六爻] 创建蓝图重审任务失败: {}", exc)
+
+
 def _resolve_written_path(path: str, task_dir: str) -> str:
     """Resolve a write_file path to an absolute path for cross-task use.
 
@@ -543,6 +1014,64 @@ def _scan_task_outputs(task_dir: str) -> list[str]:
                     written.add(path)
 
     return sorted(written)
+
+
+def _link_task_deliverables(task_dir: str, goal_id: str) -> int:
+    """Scan task outputs and copy written files to goal deliverables.
+
+    Automatically harvests files written during task execution and copies
+    them to ``<goal_dir>/deliverables/`` for cross-task reuse.  Only
+    copies files that are not already in the deliverables directory.
+
+    Returns:
+        Number of files linked.
+    """
+    written = _scan_task_outputs(task_dir)
+    if not written:
+        return 0
+
+    goal_dir = get_goal_dir(goal_id)
+    dlv_dir = goal_dir / "deliverables"
+    dlv_dir.mkdir(exist_ok=True)
+
+    # Collect existing deliverable names for dedup
+    existing: set[str] = set()
+    if dlv_dir.is_dir():
+        for f in dlv_dir.iterdir():
+            if f.is_file():
+                existing.add(f.name)
+
+    linked = 0
+    for src_path_str in written:
+        src = Path(src_path_str)
+        if not src.is_file():
+            continue
+
+        # Skip files already in deliverables/
+        src_name = src.name
+        if src_name in existing:
+            continue
+
+        # Skip files that were written directly to deliverables/ (already there)
+        try:
+            if dlv_dir.resolve() in src.resolve().parents:
+                continue
+        except Exception:
+            pass
+
+        dst = dlv_dir / src_name
+        try:
+            import shutil
+            shutil.copy2(src, dst)
+            linked += 1
+            existing.add(src_name)
+            logger.info("[六爻] 交付物归档: {} → {}", src.name, dst)
+        except Exception as exc:
+            logger.warning("[六爻] 交付物归档失败 {}: {}", src.name, exc)
+
+    if linked:
+        logger.info("[六爻] 已归档 {} 个交付物到 {}", linked, dlv_dir)
+    return linked
 
 
 def _build_evolution_task_description(
@@ -698,5 +1227,75 @@ def _build_evolution_task_description(
                 "5. 更新认知导航索引",
             ]
         )
+    elif action.action == "review_blueprint":
+        lines.extend(
+            [
+                "## 执行说明",
+                "1. 读取目标蓝图文件 (blueprint.md) 和目标轨迹 (trajectory.md)",
+                "2. 分析所有已完成任务的执行结果和进度停滞原因",
+                "3. 判断：目标定义是否有问题？拆解是否合理？当前策略是否有效？",
+                "4. 如果蓝图需要调整 — 用 edit_file 修改 blueprint.md（调整范围、重新拆解、修改判定标准）",
+                "5. 如果目标已经实际完成但判定标准过于严格 — 更新完成判定标准",
+                "6. 如果目标确实无法达成 — 在 blueprint.md 中标注为 'blocked' 并给出阻塞原因",
+                "7. 产出重审报告到目标目录: deliverable/blueprint-review.md",
+            ]
+        )
 
     return "\n".join(lines)
+
+
+def _write_pending_traps(
+    goal_id: str,
+    task_id: str,
+    proposals: list[dict],
+) -> None:
+    """Write Anqu's known_traps proposals to ``pending_traps.json`` for user confirmation.
+
+    Each proposal is enriched with source metadata (task_id, timestamp) and
+    a ``confirmed`` flag (always false when first written).
+
+    The file is stored in the goal directory and can be listed/read by the
+    main loop to present proposals to the user for confirmation.
+    """
+    from vingobot.core.workspace import get_goal_dir
+
+    goal_dir = get_goal_dir(goal_id)
+    path = goal_dir / "pending_traps.json"
+
+    # Load existing pending traps if any
+    existing: list[dict] = []
+    if path.exists():
+        try:
+            existing = json.loads(path.read_text(encoding="utf-8"))
+        except (json.JSONDecodeError, OSError):
+            existing = []
+
+    # De-duplicate: skip proposals with same name already in pending
+    existing_names = {e.get("name", "") for e in existing}
+    added_count = 0
+    for proposal in proposals:
+        name = proposal.get("name", "")
+        if name and name in existing_names:
+            logger.debug("[六爻] 跳过重复陷阱提案: {}", name)
+            continue
+        entry = dict(proposal)
+        entry.setdefault("proposed_by", "anqu")
+        entry["proposed_at"] = datetime.now(timezone.utc).isoformat()
+        entry["source_task_id"] = task_id
+        entry["confirmed"] = False
+        existing.append(entry)
+        existing_names.add(name)
+        added_count += 1
+
+    if added_count == 0:
+        logger.debug("[六爻] 所有陷阱提案已存在，跳过写入")
+        return
+
+    try:
+        path.write_text(
+            json.dumps(existing, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+        logger.info("[六爻] 写入 {} 个待确认陷阱提案到 {}", added_count, path)
+    except OSError:
+        logger.warning("[六爻] 写入待确认陷阱提案失败: {}", path)

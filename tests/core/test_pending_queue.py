@@ -358,3 +358,119 @@ class TestCleanupOrphanTasks:
 
         cleaned = PendingQueue.cleanup_orphan_tasks(timeout_ms=30 * 60 * 1000)
         assert cleaned == 0  # Invalid date → cannot determine age → skip
+
+
+# ---------------------------------------------------------------------------
+# Tests — filename_prefix routing
+# ---------------------------------------------------------------------------
+
+
+class TestFilenamePrefix:
+    """PendingTask.filename_prefix controls task filename generation."""
+
+    def test_enqueue_with_prefix(self, tmp_path: Path) -> None:
+        """Tasks with filename_prefix generate files starting with that prefix."""
+        root = _init_test_workspace(tmp_path)
+        queue = PendingQueue(root / "pending")
+
+        task = PendingTask(
+            goal_id="cognition-evolution",
+            description="DMN review task",
+            source="dmn-consciousness",
+            filename_prefix="cognition-evolution__",
+        )
+        fname = queue.enqueue(task)
+        assert fname.startswith("cognition-evolution__")
+
+    def test_enqueue_without_prefix(self, tmp_path: Path) -> None:
+        """Tasks without filename_prefix generate normal filenames."""
+        root = _init_test_workspace(tmp_path)
+        queue = PendingQueue(root / "pending")
+
+        task = PendingTask(
+            goal_id="test-goal",
+            description="regular task",
+        )
+        fname = queue.enqueue(task)
+        assert not fname.startswith("cognition-evolution")
+        assert not fname.startswith("dmn")
+
+    def test_prefixed_task_claimed_by_dmn_consumer(self, tmp_path: Path) -> None:
+        """try_consume_by_prefix('cognition-evolution') claims prefixed tasks."""
+        root = _init_test_workspace(tmp_path)
+        queue = PendingQueue(root / "pending")
+
+        task = PendingTask(
+            goal_id="cognition-evolution",
+            description="DMN review",
+            source="dmn-consciousness",
+            filename_prefix="cognition-evolution__",
+        )
+        queue.enqueue(task)
+
+        claimed = queue.try_consume_by_prefix("cognition-evolution")
+        assert claimed is not None
+
+    def test_prefixed_task_skipped_by_tpn(self, tmp_path: Path) -> None:
+        """try_consume_next(exclude_prefixes) skips prefixed tasks."""
+        root = _init_test_workspace(tmp_path)
+        queue = PendingQueue(root / "pending")
+
+        task = PendingTask(
+            goal_id="cognition-evolution",
+            description="DMN review",
+            source="dmn-consciousness",
+            filename_prefix="cognition-evolution__",
+        )
+        queue.enqueue(task)
+
+        claimed = queue.try_consume_next(
+            exclude_prefixes=["cognition-evolution", "dmn"],
+        )
+        assert claimed is None
+
+
+# ---------------------------------------------------------------------------
+# Tests — delete_tasks_for_goal
+# ---------------------------------------------------------------------------
+
+
+class TestDeleteTasksForGoal:
+    """PendingQueue.delete_tasks_for_goal removes all tasks for one goal."""
+
+    def test_deletes_only_matching_goal(self, tmp_path: Path) -> None:
+        """delete_tasks_for_goal('A') removes A's tasks, leaves B's."""
+        root = _init_test_workspace(tmp_path)
+        queue = PendingQueue(root / "pending")
+
+        queue.enqueue(PendingTask(goal_id="goal-A", description="task A1"))
+        queue.enqueue(PendingTask(goal_id="goal-A", description="task A2"))
+        queue.enqueue(PendingTask(goal_id="goal-B", description="task B1"))
+
+        deleted = queue.delete_tasks_for_goal("goal-A")
+        assert deleted == 2
+
+        remaining = queue.scan_pending()
+        assert len(remaining) == 1
+        assert remaining[0].goal_id == "goal-B"
+
+    def test_returns_zero_for_no_match(self, tmp_path: Path) -> None:
+        """delete_tasks_for_goal returns 0 when no tasks match."""
+        root = _init_test_workspace(tmp_path)
+        queue = PendingQueue(root / "pending")
+
+        queue.enqueue(PendingTask(goal_id="goal-A", description="task A1"))
+
+        deleted = queue.delete_tasks_for_goal("non-existent")
+        assert deleted == 0
+
+        remaining = queue.scan_pending()
+        assert len(remaining) == 1
+
+    def test_empty_queue(self, tmp_path: Path) -> None:
+        """delete_tasks_for_goal on empty queue returns 0."""
+        root = _init_test_workspace(tmp_path)
+        queue = PendingQueue(root / "pending")
+
+        deleted = queue.delete_tasks_for_goal("anything")
+        assert deleted == 0

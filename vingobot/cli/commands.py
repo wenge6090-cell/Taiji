@@ -9,14 +9,16 @@ from contextlib import nullcontext, suppress
 from pathlib import Path
 from typing import Any
 
-# Force UTF-8 encoding for Windows console
-if sys.platform == "win32":
-    if sys.stdout.encoding != "utf-8":
-        os.environ["PYTHONIOENCODING"] = "utf-8"
-        # Re-open stdout/stderr with UTF-8 encoding
-        with suppress(Exception):
-            sys.stdout.reconfigure(encoding="utf-8", errors="replace")
-            sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+# Force UTF-8 encoding for all platforms.
+# On Windows, the console code page may be CP936/CP932.  On WSL/Linux the
+# Python text layer can degrade over many write/flush cycles, especially
+# when Rich and prompt_toolkit alternate control of the terminal.  An
+# explicit reconfigure with 'surrogateescape' prevents ESC (\x1b) from
+# being replaced by '?' in long-running interactive sessions.
+with suppress(Exception):
+    sys.stdout.reconfigure(encoding="utf-8", errors="surrogateescape")
+    sys.stderr.reconfigure(encoding="utf-8", errors="surrogateescape")
+os.environ.setdefault("PYTHONIOENCODING", "utf-8")
 
 import typer
 from loguru import logger

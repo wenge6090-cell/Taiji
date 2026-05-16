@@ -320,6 +320,13 @@ class MingjueSource:
     rework_instruction: str = ""
     previous_output: Any = None  # MingjueOutput from previous iteration
     suggested_trigram: str = ""  # Anqu's suggested gua for the next task
+    # ── Anqu evaluation context (for 思变) ──────────────────────
+    anqu_task_summary: str = ""
+    """Anqu's summary of what the previous task accomplished."""
+    anqu_reason: str = ""
+    """Anqu's reasoning for the routing decision."""
+    anqu_goal_progress_pct: int | None = None
+    """Anqu's assessment of overall goal progress (0-100)."""
 
 
 @dataclass
@@ -371,6 +378,11 @@ class RoundExecutionFact:
     had_failable_op: bool = False
     """True if any approved call was exec/web_search/write_file/edit_file —
     i.e. an operation whose outcome cannot be predicted in advance."""
+    rework_attempt: int = 0
+    """Rework attempt number (0 = first attempt, 1+ = Anqu-ordered rework)."""
+    is_verification_round: bool = False
+    """True if this round's exec failures should be counted as verification
+    (expected to fail), not production failures that trigger degradation."""
 
 
 # ---------------------------------------------------------------------------
@@ -450,6 +462,62 @@ class ApprovedToolCall:
 
 
 # ---------------------------------------------------------------------------
+# Yin (四爻·阴) — approval + introspection output
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class YinOutput:
+    """Unified output from Yin's approval, self-reflection, and proactive arbitration.
+
+    Merges the former ``approve()`` + ``self_reflect()`` into a single
+    return value.  ``needs_reweave`` signals the inner loop that the
+    cognitive posture should be re-woven (Weaver triggered by Yin).
+
+    ``fuse_instruction`` is the proactive arbitration output: when Yin
+    detects blueprint deviation or self-abandonment contamination, it
+    injects a mandatory verification instruction (熔断) into the next
+    round's context — the Worker MUST address it before calling
+    task_complete.  This is NOT a rejection of current tool calls.
+
+    ``blueprint_deviation`` records the specific deviation found, for
+    diagnostic and logging purposes.
+    """
+
+    approved_calls: list[ApprovedToolCall] = field(default_factory=list)
+    decision: str = "skipped"
+    """'approved' | 'rejected' | 'modified' | 'skipped'"""
+    reason: str = ""
+    suggestions: str = ""
+    """Suggestions for Yang's next round."""
+    warning: str = ""
+    """Self-reflection warning (e.g. force-termination detected)."""
+    needs_reweave: bool = False
+    """Yin detected phase staleness — inner loop should re-weave posture."""
+    fuse_instruction: str = ""
+    """Proactive arbitration: mandatory verification instruction (熔断).
+
+    When Yin detects blueprint deviation or self-abandonment contamination,
+    this field contains a concrete instruction that the Worker MUST address
+    before calling task_complete.  Injected into the next round's context.
+
+    This is NOT a rejection — current round's approved tool calls still
+    execute normally.  The fuse takes effect in the NEXT round.
+    """
+    blueprint_deviation: str = ""
+    """Diagnostic record of what triggered the fuse.
+
+    When ``_detect_blueprint_deviation`` triggers: contains structured
+    detail about blueprint targets vs actual task outputs.
+    When ``_detect_self_abandonment`` triggers: contains the specific
+    abandonment signals found in execution facts.
+
+    Used for logging and debugging — the field name reflects the
+    primary use case (blueprint target comparison).
+    """
+
+
+# ---------------------------------------------------------------------------
 # Executor (五爻·执行器) — execution result
 # ---------------------------------------------------------------------------
 
@@ -495,11 +563,90 @@ class AnquDecision:
     """Goal completion percentage (0-100) as assessed by Anqu. None means not evaluated."""
     evolution_actions: list[CognitionEvolutionAction] = field(default_factory=list)
     """0-N cognitive evolution actions to enqueue after routing."""
+    known_traps_proposal: list[dict] = field(default_factory=list)
+    """Anqu-detected failure patterns to propose as known_traps.
+
+    Each proposal is a dict with:
+    - name (str): trap name in snake_case
+    - description (str): what the failure pattern is
+    - trigger (str): when it triggers
+    - response (str): how to avoid it
+
+    Proposals must be confirmed by the main loop before writing to meta.json."""
+    needs_sibian: bool = False
+    """Anqu determines that the blueprint needs SiBian review.
+
+    When True, the outer loop invokes ``run_sibian()`` to evaluate
+    cross-task failure patterns and potentially revise the blueprint.
+    Defaults to False — SiBian is only triggered when Anqu detects
+    cross-task stagnation or systematic failure modes."""
 
 
 # ---------------------------------------------------------------------------
-# GoalResult — final outcome
+# SibianDecision — 思变节点输出（连山策略引擎）
 # ---------------------------------------------------------------------------
+
+
+@dataclass
+class SibianDecision:
+    """思变节点的连山策略决策——艮止观照后的方位、时机、姿态。
+
+    思变位于 Anqu 的 goal_next_task 之后、Mingjue 的下次迭代之前。
+    它不是"蓝图审查器"，而是"障碍导航器"——目标永不动，只调整推进方式。
+
+    连山易框架：
+    - 艮止 → 停下观山势
+    - 六气 → 判断目标处于什么阶段（启动/盛长/收敛/休眠）
+    - 六甲 → 判断受阻的时序状态（第几次遇阻、上次策略变更多久）
+    - 三元 → 判断上下文新鲜度
+    - 阴阳对峙 → 推力与阻力的对比分析
+    - 方位决策 → 从哪个方向、什么时机、以什么姿态继续推进
+    """
+
+    # ── 方位决策 ──────────────────────────────────────
+    action: Literal[
+        "continue",          # 无障碍，照常推进
+        "push_through",      # 强攻——正面突破（换工具/加力度）
+        "navigate_around",   # 绕行——换条路（换卦象/换方法）
+        "wait_gather",       # 主动等待——暂停强攻、收集信息
+        "decompose",         # 拆解——目标太大，拆成更小子目标
+        "escalate",          # 升级——需要外部干预（人类介入/环境变更）
+        "abort",             # 终止——目标在当下约束内确实无法推进
+    ] = "continue"
+
+    # ── 连山时序分析 ──────────────────────────────────
+    liuq: str = ""
+    """六气判断——目标当前处于什么季节阶段（春-启动/夏-盛长/秋-收敛/冬-休眠）。"""
+
+    liujia: str = ""
+    """六甲判断——时序状态：第几次受阻、距上次策略变更多久、是否有恶性循环。"""
+
+    sanyuan: str = ""
+    """三元判断——上下文新鲜度：蓝图是否刚更新、认知库是否刷新、环境是否变化。"""
+
+    duizhi: str = ""
+    """阴阳对峙分析——推力（有效策略/工具/进展）vs 阻力（失败模式/缺失能力/环境约束）。"""
+
+    # ── 推进策略 ──────────────────────────────────────
+    strategy: str = ""
+    """具体的推进策略描述，注入到 Mingjue 的 continuation_context。"""
+
+    trigram_hint: str = ""
+    """建议下轮 Mingjue 使用的卦象。空字符串表示不改变当前卦象。"""
+
+    timing: Literal["now", "after_refresh", "after_one_task"] = "now"
+    """时机判断：
+    - now: 立即行动
+    - after_refresh: 等待上下文刷新后再动（如刷新认知库）
+    - after_one_task: 等下一任务完成后再评估
+    """
+
+    reason: str = ""
+    """决策理由——注入到 Mingjue 下一轮的 continuation_context 中。"""
+
+    blueprint_revision: str = ""
+    """[DEPRECATED] 仅 navigate_around 时如果涉及蓝图可调层微调，填写修订内容。
+    不是改写目标，是调整任务拆解方式/执行顺序/中间里程碑。"""
 
 
 @dataclass

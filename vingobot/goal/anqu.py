@@ -34,6 +34,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import re
 from pathlib import Path
 from typing import Any
 
@@ -43,6 +44,180 @@ from vingobot.core.goal_context import GoalContext
 from vingobot.core.workspace import get_workspace_paths
 from vingobot.goal.grid_types import CognitionEvolutionAction, CognitionUsage
 from vingobot.goal.types import AnquAction, AnquDecision, RoundExecutionFact
+from vingobot.goal.yin import ABANDONMENT_KEYWORDS, BLUEPRINT_TARGET_PATTERNS
+
+
+# ---------------------------------------------------------------------------
+# Blueprint completion verification — deterministic comparison helper
+# ---------------------------------------------------------------------------
+
+# NOTE: BLUEPRINT_TARGET_PATTERNS and ABANDONMENT_KEYWORDS are imported
+# from vingobot.goal.yin (single source of truth).
+
+
+def _verify_blueprint_completion(
+    blueprint: str,
+    recent_task_statuses: list,
+    memory: str,
+    trajectory: str,
+    total_tasks: int,
+) -> str:
+    """Build a deterministic blueprint-vs-reality comparison for Anqu.
+
+    Parses the blueprint for quantitative completion targets and compares
+    against what the task chain has actually produced.  Also checks for
+    self-abandonment contamination in task status summaries.
+
+    Returns a Markdown-formatted comparison section to inject into Anqu's
+    system prompt.  Returns empty string if no quantifiable targets found.
+    """
+    if not blueprint or blueprint == "(无蓝图)":
+        return ""
+
+    # ── Extract numeric targets from blueprint ───────────────
+    targets: list[tuple[str, int]] = []
+    for pattern in BLUEPRINT_TARGET_PATTERNS:
+        for m in pattern.finditer(blueprint):
+            try:
+                count = int(m.group(1))
+                if count >= 1:
+                    context = blueprint[max(0, m.start() - 30):m.end() + 30]
+                    targets.append((context.strip(), count))
+            except (ValueError, IndexError):
+                continue
+
+    # Deduplicate
+    unique_targets: dict[str, int] = {}
+    for ctx, count in targets:
+        key = ctx[:50]
+        if key not in unique_targets or count > unique_targets[key]:
+            unique_targets[key] = count
+
+    # ── Scan recent task statuses for abandonment ────────────
+    abandonment_signals: list[str] = []
+    for task in (recent_task_statuses or []):
+        task_id = getattr(task, "task_id", "?")
+        status = getattr(task, "status", "?")
+        snippet = (getattr(task, "summary_snippet", "") or "").lower()
+        for kw in ABANDONMENT_KEYWORDS:
+            if kw.lower() in snippet:
+                abandonment_signals.append(
+                    f"任务 {task_id} ({status}): ...{kw}..."
+                )
+                break
+
+    # ── Check for user confirmation ─────────────────────────
+    combined_text = (memory + " " + trajectory).lower()
+    user_confirmed = any(kw in combined_text for kw in (
+        "ask_user", "用户确认", "user confirmed",
+    ))
+
+    # ── Build comparison section ────────────────────────────
+    lines: list[str] = ["## 蓝图完成验证（阴·主动仲裁提供的对照数据）\n"]
+
+    if unique_targets:
+        lines.append("### 从蓝图解析出的量化目标")
+        for ctx, count in list(unique_targets.items())[:5]:
+            lines.append(f"- 预期 **{count}** 个: `{ctx}...`")
+        lines.append("")
+        lines.append(
+            f"### 实际执行情况\n"
+            f"- 已完成任务总数: **{total_tasks}**\n"
+            f"- 各任务产出摘要请见上方「近期已完成任务」\n"
+        )
+    else:
+        lines.append("（未能从蓝图中解析出量化目标，请基于蓝图整体内容判断）\n")
+
+    if abandonment_signals:
+        lines.append("### ⚠️ 检测到自我放弃污染")
+        lines.append("以下任务产出中包含放弃/跳过/不可行等语言：")
+        for sig in abandonment_signals[:5]:
+            lines.append(f"- {sig}")
+        lines.append("")
+        if user_confirmed:
+            lines.append("✓ 目标记忆/轨迹中检测到用户确认记录 — 放弃可能是用户认可的")
+        else:
+            lines.append("**✗ 未检测到用户确认记录！** 这些放弃声明可能未经用户认可。")
+            lines.append("在判定 goal_completed 之前，请仔细核实这些放弃是否合理。")
+            lines.append("")
+
+    lines.append(
+        "### 判定提醒\n"
+        "1. 如果蓝图有明确的量化目标但实际任务产出远低于目标 → 不应判定为 goal_completed\n"
+        "2. 如果存在自我放弃信号且无用户确认 → 应继续推进（goal_next_task），不应关闭目标\n"
+        "3. 如果用户确实认可了范围的缩小 → 应记录确认证据后再判定 goal_completed\n"
+    )
+
+    return "\n".join(lines)
+
+
+# ---------------------------------------------------------------------------
+# 强制验证回炉 — 首次 task_complete 检测 + verify instruction
+# ---------------------------------------------------------------------------
+
+
+def _needs_verification(task_dir: str) -> bool:
+    """Check if the just-completed task needs a mandatory verification round.
+
+    Every task's first ``task_complete`` triggers a ``verify_task`` rework.
+    The marker file ``.anqu_verified`` is created when the first
+    ``verify_task`` is issued, so subsequent Anqu calls on the same task
+    (after the verification round completes) know verification is done.
+    """
+    if not task_dir:
+        return False
+    return not (Path(task_dir) / ".anqu_verified").exists()
+
+
+def _mark_verification_pending(task_dir: str) -> None:
+    """Create the verification marker so re-entry skips to evaluation."""
+    try:
+        Path(task_dir).mkdir(parents=True, exist_ok=True)
+        (Path(task_dir) / ".anqu_verified").write_text("")
+        logger.debug("[暗驱] 已写入验证标记: {}", task_dir)
+    except OSError:
+        logger.warning("[暗驱] 无法写入验证标记: {}", task_dir)
+
+
+def _build_verify_instruction(
+    goal_context: GoalContext,
+) -> str:
+    """Build the verification instruction for the rework round.
+
+    Instructs Yang to validate every output file in the task's ``outputs/``
+    directory — checking integrity via appropriate commands — and produce
+    a structured quality report before calling ``task_complete``.
+    """
+    bp = (goal_context.blueprint_summary or "")[:1000]
+
+    return (
+        "## 📋 强制验证指令\n\n"
+        "这是任务首次完成后的**强制性验证回炉**。你必须验证上一轮产出物的质量和完整性，"
+        "而不是创建新的内容文件。\n\n"
+        "### 验证步骤（必须按顺序执行）\n\n"
+        "1. **列出产出** — 用 `list_directory` 查看 task_dir/outputs/ 目录，确认有哪些产出文件\n"
+        "2. **完整性检查** — 对每个产出文件执行适当的验证命令：\n"
+        "   - 视频文件 (.mp4/.mov/.avi/.webm): `ffprobe -v error <file>` — 确认文件完整\n"
+        "   - 视频分辨率与音轨: `ffprobe -v quiet -print_format json -show_streams <file>` — 确认有视频流+音频流\n"
+        "   - Python 脚本 (.py): `python -c 'compile(open(\"<file>\").read(), \"<file>\", \"exec\")'` — 确认语法正确\n"
+        "   - Shell 脚本 (.sh): `bash -n <file>` — 确认语法正确\n"
+        "   - JSON 文件 (.json): `python -c 'import json; json.load(open(\"<file>\"))'` — 确认格式有效\n"
+        "3. **内容抽查** — 对文本类产出文件，用 `read_file` 读取内容片段，确认非空、内容合理\n"
+        "4. **写入验证报告** — 用 `write_file` 将以下内容写入 `outputs/quality-report.md`：\n"
+        "   - 被验证的产出文件列表（文件路径 + 大小）\n"
+        "   - 每个文件的完整性/语法检查结果（通过/失败）\n"
+        "   - 截图/抽样的观察结果\n"
+        "   - 总体结论：**全部通过** 或 **部分失败需修复**\n\n"
+        "### 蓝图质量参考\n\n"
+        f"```\n{bp}\n```\n\n"
+        "### 结束条件\n\n"
+        "- 所有验证通过 → 调用 `task_complete` 结束任务\n"
+        "- 发现文件损坏或格式问题 → 先用 `edit_file` 修复产出，"
+        "修复后再次验证，确认通过后调用 `task_complete`\n"
+        "- **不要创建新的内容文件** — 这是验证轮次，不是生产轮次\n"
+        "- **不要把 exec 验证失败当作任务失败** — exec 返回非零 = 发现问题，"
+        "这是预期行为，修复后继续即可\n"
+    )
 
 
 async def run_anqu(
@@ -104,7 +279,17 @@ async def run_anqu(
             rework_instruction=instruction,
         )
 
-    # ── Task completed → evaluate goal progress ──────────────────
+    # ── 强制验证回炉：任何任务的第一次 task_complete → verify_task ──
+    if _needs_verification(task_dir):
+        _mark_verification_pending(task_dir)
+        logger.info("[暗驱] 首次完成 → 强制验证回炉 (task_dir={})", task_dir)
+        return AnquDecision(
+            action="verify_task",
+            task_summary="任务首次完成，正在执行强制性质量验证",
+            rework_instruction=_build_verify_instruction(goal_context),
+        )
+
+    # ── Task completed (already verified) → evaluate goal progress ──
     return await _evaluate_goal_progress(
         goal_context,
         current_task_facts,
@@ -170,7 +355,13 @@ async def _evaluate_goal_progress(
     )
 
     # Build cognitive usage context for evolution evaluation
-    cognitive_context = _build_cognitive_context(cognitive_usage)
+    # Also detect which grid-recommended skills were NOT used
+    grid_available_skills = _get_grid_available_skills(
+        cognitive_usage.grids_loaded if cognitive_usage else []
+    )
+    cognitive_context = _build_cognitive_context(
+        cognitive_usage, grid_available_skills,
+    )
 
     # 列出目标目录 + 任务输出目录文件清单（相对于目标目录的路径，方便 read_file）
     goal_file_listing = _list_dir_files(goal_dir_path, "目标目录")
@@ -182,6 +373,17 @@ async def _evaluate_goal_progress(
         if mingjue_progress_pct is not None and mingjue_progress_pct > 0
         else "明觉尚未做进度评估。"
     )
+
+    # ── 蓝图完成验证（阴·主动仲裁对照数据）─────────────────
+    blueprint_verification = ""
+    if goal_context.blueprint_summary and goal_context.blueprint_summary != "(无蓝图)":
+        blueprint_verification = _verify_blueprint_completion(
+            blueprint=goal_context.blueprint_summary,
+            recent_task_statuses=recent,
+            memory=memory,
+            trajectory=trajectory,
+            total_tasks=total_tasks,
+        )
 
     system_prompt = f"""你是上爻·暗驱，目标的最高决策者。
 
@@ -220,12 +422,15 @@ Yang 的最终输出:
 
 {cognitive_context}
 
+{blueprint_verification}
+
 ## 决策指南
 - 所有完成标准都已满足 → goal_completed
 - 目标明显无法达成 → goal_failed
 - 任务结果不完整或质量不高 → continue_task / verify_task / learn_task
 - 目标还有差距 → goal_next_task 并给出清晰可执行的下一步
 - **next_task_concrete_action（重要）**：必须给出下一任务的第一步具体行动，格式如 "write_file outputs/05-xxx.py 产出..."。**必须包含文件路径和工具名**。
+- **技能利用率判定（关键）**：如果上方出现"技能利用率警告"，说明 Worker 有可用技能但未调用。此时任务失败**更可能是技能未使用**而非目标不可行——请判定为 `goal_next_task`（而非 `goal_failed`），并在 next_task_description 中明确指出"必须优先调用已注入的技能工具"。
 
 ## 认知演化指南 (evolution 数组)
 
@@ -247,6 +452,18 @@ Yang 的最终输出:
 **关键原则**: 让每一次任务执行都沉淀为可复用的认知资产。
 DMN 会通过任务目录直接获取执行数据自主分析。请大胆决策。
 
+## 已知陷阱检测 (known_traps_proposal)
+
+你是任务执行的直接观察者——你看到了执行事实（facts_summary），你知道哪些操作模式导致了失败。
+
+如果本次任务中出现了**可复现的失败模式**（特定工具或操作路径反复失败），请将其记录为 known_trap 提案，供下轮明觉读取后提前规避：
+
+- **只在明确观察到失败模式时提案**——不要猜测，必须有执行事实支撑
+- 每个陷阱格式：name (snake_case)、description (失败模式描述)、trigger (触发条件)、response (应对策略)
+- 例如：exec 安装操作被 L4 安全策略拒绝 → {{"name": "exec-install-blocked", "description": "exec 工具执行安装命令被安全策略拒绝", "trigger": "任务尝试用 exec 安装系统级软件包", "response": "改用容器内预装工具，或在容器初始化阶段提供依赖"}}
+- 例如：工具反复调用返回空结果 → {{"name": "empty-search-loop", "description": "搜索/查询工具反复返回空结果但继续调用", "trigger": "连续多轮工具调用无有效返回", "response": "最多尝试 2 次不同来源，然后切换为直接产出策略"}}
+- 如果任务中没有新的失败模式 → 空数组 []
+
 ## 输出格式
 调查完成后，调用 task_complete，summary 字段输出以下 JSON：
 
@@ -265,6 +482,14 @@ DMN 会通过任务目录直接获取执行数据自主分析。请大胆决策�
       "target_name": "技能/模型/格栅名称（snake_case）",
       "description": "要创建或更新的内容描述",
       "priority": 1-10
+    }}
+  ],
+  "known_traps_proposal": [
+    {{
+      "name": "陷阱名称（snake_case）",
+      "description": "失败模式描述",
+      "trigger": "触发条件",
+      "response": "应对策略"
     }}
   ]
 }}
@@ -317,6 +542,11 @@ DMN 会通过任务目录直接获取执行数据自主分析。请大胆决策�
         source_goal_id=getattr(goal_context, "goal_id", ""),
     )
 
+    # ── Parse known traps proposal ──────────────────────────────
+    known_traps_proposal = _parse_known_traps_proposal(
+        parsed.get("known_traps_proposal", []),
+    )
+
     # Supplement with computed actions if LLM returned empty evolution
     if not evolution:
         evolution = _compute_evolution_actions(
@@ -335,6 +565,13 @@ DMN 会通过任务目录直接获取执行数据自主分析。请大胆决策�
         rework_instruction=parsed.get("reason", ""),
         failure_reason=parsed.get("reason", "") if action == "goal_failed" else "",
         evolution_actions=evolution,
+        known_traps_proposal=known_traps_proposal,
+        needs_sibian=_compute_needs_sibian(
+            goal_context=goal_context,
+            known_traps_proposal=known_traps_proposal,
+            facts=facts,
+            total_tasks=effective_total,
+        ),
     )
 
 
@@ -366,8 +603,49 @@ def _list_dir_files(dir_path: str, label: str = "", base_dir: str = "") -> str:
         return ""
 
 
-def _build_cognitive_context(cognitive_usage: CognitionUsage | None) -> str:
-    """Build the cognitive usage context block for Anqu's prompt."""
+def _get_grid_available_skills(grid_names: list[str]) -> dict[str, list[str]]:
+    """Read loaded grid JSON files and extract their skill references.
+
+    Returns a dict mapping grid_name → list of skill names that the
+    grid recommends.  An empty dict if grids don't exist or can't be read.
+    """
+    if not grid_names:
+        return {}
+
+    wp = get_workspace_paths()
+    result: dict[str, list[str]] = {}
+
+    for name in grid_names:
+        grid_path = wp.grids / f"{name}.json"
+        try:
+            if not grid_path.is_file():
+                continue
+            data = json.loads(grid_path.read_text(encoding="utf-8"))
+            skills = data.get("skills", [])
+            skill_names: list[str] = []
+            for s in skills:
+                if isinstance(s, str):
+                    skill_names.append(s)
+                elif isinstance(s, dict):
+                    skill_names.append(s.get("name", ""))
+            result[name] = [n for n in skill_names if n]
+        except (OSError, json.JSONDecodeError, ValueError):
+            logger.debug("[暗驱] 无法读取格栅文件: {}", grid_path)
+
+    return result
+
+
+def _build_cognitive_context(
+    cognitive_usage: CognitionUsage | None,
+    grid_available_skills: dict[str, list[str]] | None = None,
+) -> str:
+    """Build the cognitive usage context block for Anqu's prompt.
+
+    When *grid_available_skills* is provided, this function also
+    computes which grid-recommended skills were **not** used and
+    emits a prominent warning — so Anqu can distinguish "task truly
+    infeasible" from "available skills simply weren't called".
+    """
     if cognitive_usage is None:
         return ""
 
@@ -383,6 +661,39 @@ def _build_cognitive_context(cognitive_usage: CognitionUsage | None) -> str:
         parts.append(f"- 调用失败的工具: {', '.join(cognitive_usage.tools_failed)}")
     parts.append(f"- 总工具调用次数: {cognitive_usage.tool_calls_total}")
 
+    # ── Skill utilization gap detection ──────────────────────────
+    if grid_available_skills:
+        used = set(cognitive_usage.skills_used)
+        # Filter out internal markers like "__read__"
+        used_clean = {s for s in used if not s.startswith("__")}
+
+        all_available: set[str] = set()
+        for skills in grid_available_skills.values():
+            all_available.update(skills)
+
+        unused = all_available - used_clean
+
+        if unused:
+            parts.append("")
+            parts.append(
+                "### ⚠️ 技能利用率警告"
+            )
+            parts.append(
+                f"当前格栅推荐了以下技能，但 Worker 在本任务中**未调用**: "
+                f"{', '.join(sorted(unused))}"
+            )
+            for grid_name, skills in grid_available_skills.items():
+                grid_unused = [s for s in skills if s in unused]
+                if grid_unused:
+                    parts.append(
+                        f"  - 格栅 `{grid_name}` 推荐但未使用: "
+                        f"{', '.join(grid_unused)}"
+                    )
+            parts.append(
+                "**重要**: 任务失败可能是技能未调用导致，"
+                "不一定是目标不可行。请勿仅因本次未产出即判定 `goal_failed`。"
+            )
+
     return "\n".join(parts)
 
 
@@ -395,7 +706,7 @@ def _parse_evolution_actions(
     if not raw_evolution:
         return []
 
-    valid_actions = {"learn_skill", "precipitate_skill", "precipitate_model", "create_grid", "research", "investigate"}
+    valid_actions = {"learn_skill", "precipitate_skill", "precipitate_model", "create_grid", "research", "investigate", "review_blueprint"}
     actions: list[CognitionEvolutionAction] = []
 
     for item in raw_evolution:
@@ -416,6 +727,36 @@ def _parse_evolution_actions(
         )
 
     return actions
+
+
+def _parse_known_traps_proposal(
+    raw_proposals: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Parse known_traps_proposal from Anqu's JSON output.
+
+    Validates that each proposal has at least name + description.
+    Skips incomplete or empty entries.
+    """
+    if not raw_proposals:
+        return []
+
+    valid: list[dict[str, Any]] = []
+    for item in raw_proposals:
+        if not isinstance(item, dict):
+            continue
+        name = (item.get("name") or "").strip()
+        description = (item.get("description") or "").strip()
+        if not name or not description:
+            logger.warning("[暗驱] 跳过不完整的 known_trap 提案: {}", item)
+            continue
+        valid.append({
+            "name": name,
+            "description": description,
+            "trigger": (item.get("trigger") or "").strip(),
+            "response": (item.get("response") or "").strip(),
+        })
+
+    return valid
 
 
 def _compute_evolution_actions(
@@ -517,6 +858,104 @@ def _compute_evolution_actions(
     return []
 
 
+def _compute_known_traps_proposal(
+    facts: list[RoundExecutionFact],
+    cognitive_usage: CognitionUsage | None = None,
+    round_count: int = 0,
+) -> list[dict[str, Any]]:
+    """Compute known_traps proposals from execution facts.
+
+    Used in the fallback path when Anqu LLM is unavailable.
+    Detects clear failure patterns that should be avoided in future tasks.
+    """
+    proposals: list[dict[str, Any]] = []
+    failures = sum(1 for f in facts if f.execution_status in ("failure", "partial_failure", "exec_failed"))
+
+    # Tool failures (specific known-bad operations)
+    if cognitive_usage and cognitive_usage.tools_failed:
+        for tool in cognitive_usage.tools_failed[:2]:
+            proposals.append({
+                "name": f"{tool.replace('-', '_')}_fails",
+                "description": f"工具 '{tool}' 在任务中调用失败",
+                "trigger": f"任务尝试使用 {tool} 工具",
+                "response": f"优先查找替代方案：检查认知库中是否有 {tool} 的使用经验，或咨询用户替代路径",
+            })
+
+    # High failure rate pattern → diagnosis addiction risk
+    if failures > 0 and round_count >= 10 and failures / max(round_count, 1) >= 0.3:
+        proposals.append({
+            "name": "diagnosis-addiction",
+            "description":
+                f"任务 {round_count} 轮中失败 {failures} 次（失败率 {failures/max(round_count,1):.0%}），"
+                "可能是反复尝试同一种失败方案而非切换策略",
+            "trigger": "连续多轮执行失败且没有产出新的交付物",
+            "response": "遇到失败后最多重试一种替代方案，若仍失败则直接切换为最小可行产出模式（write_file 写简化版）",
+        })
+
+    # Self-read loop pattern
+    read_only = sum(
+        1 for f in facts
+        if f.tool_call_count > 0 and not f.had_action_request
+    )
+    if read_only >= 8 and round_count >= 12:
+        proposals.append({
+            "name": "read-only-loop",
+            "description":
+                f"任务有 {read_only} 轮为纯读取无写操作（总计 {round_count} 轮），"
+                "可能陷入了只读不产的循环",
+            "trigger": "连续多轮仅调用 read_file / list_directory / search 等读取工具",
+            "response": "每轮必须产生可交付输出（write_file / edit_file），至少每 3 轮一次写入产出",
+        })
+
+    return proposals
+
+
+def _compute_needs_sibian(
+    goal_context: GoalContext | None,
+    known_traps_proposal: list[dict[str, Any]],
+    facts: list[RoundExecutionFact],
+    total_tasks: int,
+) -> bool:
+    """Determine if SiBian (blueprint review) should be triggered.
+
+    SiBian is the symmetric counterpart of Weaver at the goal level:
+    - Weaver revises cognitive posture within a task (triggered by Yin)
+    - SiBian revises the blueprint across tasks (triggered by Anqu)
+
+    Both use the same 思变↔织 cross-cycle symmetry principle.
+
+    Triggers when:
+    - Known traps detected (failure patterns need blueprint adjustment)
+    - Cross-task: 2+ consecutive task failures
+    - Current task: all-round failure (0 successes in >=5 rounds)
+    - High task count: blueprint may need refresh after many tasks
+    """
+    # ── Known traps triggered — failure pattern needs blueprint review ──
+    if known_traps_proposal:
+        return True
+
+    # ── Cross-task: 2+ consecutive task failures ──
+    if goal_context is not None:
+        recent = goal_context.recent_task_statuses
+        if recent and len(recent) >= 2:
+            last2 = recent[-2:]
+            if all(getattr(t, "status", "") in ("failed", "auto_terminated") for t in last2):
+                return True
+
+    # ── Current task: all-round failure (0 successes in >=5 rounds) ──
+    total_rounds = len(facts)
+    if total_rounds >= 5:
+        successes = sum(1 for f in facts if f.execution_status == "success")
+        if successes == 0:
+            return True
+
+    # ── High task count: blueprint likely needs refresh ──
+    if total_tasks >= 5:
+        return True
+
+    return False
+
+
 def _fallback_anqu(
     final_content: str,
     facts: list[RoundExecutionFact],
@@ -533,9 +972,11 @@ def _fallback_anqu(
 
     # ── Stop condition: too many tasks with poor performance ──
     if total_tasks >= 6 and failures > successes:
+        traps = _compute_known_traps_proposal(facts, cognitive_usage, round_count)
         return AnquDecision(
             action="goal_completed",
             task_summary=f"目标已运行 {total_tasks} 个任务，最近任务成功率持续偏低（{successes} 成功/{failures} 失败），建议停止。最后产出: {summary}",
+            known_traps_proposal=traps,
         )
 
     # Build evidence-based continuation context
@@ -566,6 +1007,8 @@ def _fallback_anqu(
         total_tasks=total_tasks,
     )
 
+    traps = _compute_known_traps_proposal(facts, cognitive_usage, round_count)
+
     return AnquDecision(
         action="goal_next_task",
         task_summary=summary,
@@ -575,6 +1018,13 @@ def _fallback_anqu(
         goal_progress_pct=mingjue_progress_pct,
         continuation_context=context,
         evolution_actions=evolution,
+        known_traps_proposal=traps,
+        needs_sibian=_compute_needs_sibian(
+            goal_context=None,  # fallback path has no goal_context
+            known_traps_proposal=traps,
+            facts=facts,
+            total_tasks=total_tasks,
+        ),
     )
 
 

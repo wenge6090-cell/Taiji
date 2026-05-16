@@ -416,7 +416,10 @@ async def create_truth(
 async def execute_evolution_action(ea: CognitionEvolutionAction) -> bool:
     """Execute a single cognitive evolution action.
 
-    Dispatches to the appropriate creator based on ``action`` type.
+    Dispatches to the appropriate creator or updater based on ``action`` type.
+    When an asset already exists, "precipitate_*" actions will automatically
+    update it instead of skipping.  "revise_*" actions explicitly target updates.
+
     Returns ``True`` if an asset was created or updated.
 
     Args:
@@ -425,25 +428,56 @@ async def execute_evolution_action(ea: CognitionEvolutionAction) -> bool:
     Returns:
         True if the action resulted in a new/updated cognitive asset.
     """
+    from vingobot.goal.cognition_updater import (
+        update_skill,
+        update_model,
+        revise_truth as _revise_truth,
+    )
+
     action = ea.action
     target = ea.target_name
     ctx = ea.context or {}
 
-    if action == "learn_skill":
+    # ── Skill create-or-update ──────────────────────
+    if action in ("learn_skill", "precipitate_skill", "revise_skill"):
+        # Check if skill already exists
+        from vingobot.core.workspace import get_workspace_paths
+        wp = get_workspace_paths()
+        skill_dir = wp.skills / target
+
+        if skill_dir.is_dir():
+            # Update existing skill
+            return update_skill(
+                name=target,
+                updated_description=ctx.get("description", ea.description),
+                updated_tools=ctx.get("suggested_tools"),
+                revision_reason=ctx.get("revision_reason", ea.description),
+            )
+        # Create new skill
         return await create_skill(
             name=target,
             description=ctx.get("description", ea.description),
             tools=ctx.get("suggested_tools"),
         )
 
-    if action == "precipitate_skill":
-        return await create_skill(
-            name=target,
-            description=ctx.get("description", ea.description),
-            tools=ctx.get("suggested_tools"),
-        )
+    # ── Model create-or-update ──────────────────────
+    if action in ("precipitate_model", "revise_model"):
+        from vingobot.core.workspace import get_workspace_paths
+        wp = get_workspace_paths()
+        model_path = wp.models / f"{target}.json"
 
-    if action == "precipitate_model":
+        if model_path.exists():
+            # Determine confidence adjustment from context
+            conf_adjust = float(ctx.get("confidence_adjust", 0.1))
+            return update_model(
+                name=target,
+                content=ctx.get("insight", ea.description),
+                confidence_adjust=conf_adjust,
+                source_skills=ctx.get("source_skills"),
+                source_grids=ctx.get("source_grids"),
+                revision_reason=ctx.get("revision_reason", ea.description),
+            )
+        # Create new model
         return await create_model(
             name=target,
             content=ctx.get("insight", ea.description),
@@ -468,6 +502,15 @@ async def execute_evolution_action(ea: CognitionEvolutionAction) -> bool:
             rules=ctx.get("rules"),
             source_grids=ctx.get("source_grids"),
             confidence=float(ctx.get("confidence", 0.0)),
+        )
+
+    if action == "revise_truth":
+        return _revise_truth(
+            name=target,
+            title=ctx.get("title", ea.description),
+            rules=ctx.get("rules"),
+            confidence=float(ctx.get("confidence", 0.0)),
+            revision_reason=ctx.get("revision_reason", ea.description),
         )
 
     logger.warning("[认知演化] 未知动作类型: {}", action)

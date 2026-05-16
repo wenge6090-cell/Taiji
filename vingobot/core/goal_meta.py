@@ -46,6 +46,9 @@ class GoalMeta:
     rounds_completed: int = 0
     auto_managed: bool = True        # False = main-loop scanner skips this goal
 
+    # ── Per-goal anti-pattern table (目标格栅) ──
+    known_traps: list[dict] = field(default_factory=list)
+
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> GoalMeta:
         sd = data.get("self_driven") or {}
@@ -66,6 +69,8 @@ class GoalMeta:
             warnings=list(data.get("warnings") or []),
             rounds_completed=int(data.get("rounds_completed", 0)),
             auto_managed=bool(data.get("auto_managed", True)),
+            # Per-goal anti-pattern table
+            known_traps=list(data.get("known_traps") or []),
         )
 
     def to_dict(self) -> dict[str, Any]:
@@ -85,6 +90,7 @@ class GoalMeta:
             "warnings": self.warnings,
             "rounds_completed": self.rounds_completed,
             "auto_managed": self.auto_managed,
+            "known_traps": self.known_traps,
         }
 
 

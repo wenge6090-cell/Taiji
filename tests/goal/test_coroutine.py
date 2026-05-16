@@ -262,3 +262,105 @@ class TestWorkerPoolControlPlane:
         assert len(dmn_tasks) >= 1  # or 2 (if re-enqueued), at least 1
 
         await pool.stop()
+
+
+# ---------------------------------------------------------------------------
+# Tests — on_task_complete callback (TPN→DMN feedback)
+# ---------------------------------------------------------------------------
+
+
+class TestOnTaskComplete:
+    """WorkerPool invokes on_task_complete after each sixiang loop."""
+
+    async def test_callback_fires_on_success(self, tmp_path: Path) -> None:
+        """Callback receives goal_id, success=True, and summary on success."""
+        root = _init_test_workspace(tmp_path)
+
+        call_log: list[tuple[str, bool, str]] = []
+
+        async def _mock_run(
+            goal_id: str, description: str, signal: asyncio.Task | None,
+        ) -> object:
+            from vingobot.goal.types import GoalResult
+            return GoalResult(status="completed", goal_id=goal_id)
+
+        async def _on_complete(goal_id: str, success: bool, summary: str) -> None:
+            call_log.append((goal_id, success, summary))
+
+        _create_goal_meta(root, "goal-test")
+        _enqueue_task(root, "goal-test", "test task")
+
+        pool = WorkerPool(
+            max_workers=1,
+            poll_interval_ms=200,
+            run_task_fn=_mock_run,
+            on_task_complete=_on_complete,
+        )
+        await pool.start()
+
+        # Wait for the worker to pick up and complete the task
+        await asyncio.sleep(0.5)
+        await pool.stop()
+
+        assert len(call_log) == 1
+        goal_id, success, summary = call_log[0]
+        assert goal_id == "goal-test"
+        assert success is True
+        assert "test task" in summary
+
+    async def test_callback_fires_on_failure(self, tmp_path: Path) -> None:
+        """Callback receives success=False when _run_task_fn raises."""
+        root = _init_test_workspace(tmp_path)
+
+        call_log: list[tuple[str, bool, str]] = []
+
+        async def _mock_run(
+            goal_id: str, description: str, signal: asyncio.Task | None,
+        ) -> object:
+            raise RuntimeError("simulated failure")
+
+        async def _on_complete(goal_id: str, success: bool, summary: str) -> None:
+            call_log.append((goal_id, success, summary))
+
+        _create_goal_meta(root, "goal-fail")
+        _enqueue_task(root, "goal-fail", "failing task")
+
+        pool = WorkerPool(
+            max_workers=1,
+            poll_interval_ms=200,
+            run_task_fn=_mock_run,
+            on_task_complete=_on_complete,
+        )
+        await pool.start()
+        await asyncio.sleep(0.5)
+        await pool.stop()
+
+        assert len(call_log) >= 1
+        goal_id, success, summary = call_log[0]
+        assert goal_id == "goal-fail"
+        assert success is False
+        assert "failing" in summary
+
+    async def test_callback_not_required(self, tmp_path: Path) -> None:
+        """WorkerPool works fine without on_task_complete (backward compat)."""
+        root = _init_test_workspace(tmp_path)
+
+        async def _mock_run(
+            goal_id: str, description: str, signal: asyncio.Task | None,
+        ) -> object:
+            from vingobot.goal.types import GoalResult
+            return GoalResult(status="completed", goal_id=goal_id)
+
+        _create_goal_meta(root, "goal-ok")
+        _enqueue_task(root, "goal-ok", "task without callback")
+
+        pool = WorkerPool(
+            max_workers=1,
+            poll_interval_ms=200,
+            run_task_fn=_mock_run,
+            # No on_task_complete
+        )
+        await pool.start()
+        await asyncio.sleep(0.5)
+        await pool.stop()
+        # Should not crash

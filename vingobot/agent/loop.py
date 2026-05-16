@@ -281,6 +281,9 @@ class AgentLoop:
         # DMN goal-state cache: periodically refreshed snapshot of all goals
         self._goal_states: dict[str, dict[str, object]] = {}
         self._goal_states_at: float = 0.0  # monotonic timestamp of last scan
+        # DMN 坤元意识: exposed for DmnTool introspection & consumer cycle tracking
+        self._dmn_consciousness: Any = None
+        self._dmn_last_cycle_at: float = 0.0
         self._goal_states_lock = asyncio.Lock()
         self._session_locks: dict[str, asyncio.Lock] = {}
         # Per-session pending queues for mid-turn message injection.
@@ -330,6 +333,7 @@ class AgentLoop:
         self._runtime_vars: dict[str, Any] = {}
         self._current_iteration: int = 0
         self._tpn_bot: Any = None  # Set by vingobot for sixiang pool control
+        self._dmn_consciousness: Any = None  # DmnConsciousness — 坤元意识模型, lazy-init in consumer
         self.commands = CommandRouter()
         register_builtin_commands(self.commands)
 
@@ -1074,26 +1078,55 @@ class AgentLoop:
             logger.debug("[DMN] 汇报失败 (channel={})", channel)
 
     async def _run_dmn_consumer(self) -> None:
-        """DMN consumer: polls pending/ for cognitive evolution tasks.
+        """DMN 坤元意识 — 自主意识周天 + 被动任务消费。
 
-        Works like WorkerPool but only consumes ``cognition-evolution__*``
-        and ``dmn__*`` prefixed ``.task`` files.  Each task is processed
-        by ``_run_dmn_turn`` which injects DMN system prompts and reuses
-        the existing AgentLoop (LLM + tools).
+        Two interleaved modes:
+
+        1. **自主意识周天** (Guizang consciousness cycle):
+           起念 → 立目标 → 整理认知, driven by the 八气 (eight qi) state machine.
+           Produces ``ConsciousnessResult`` with actionable directives.
+
+        2. **被动任务消费** (backward-compatible):
+           Consumes ``cognition-evolution__*`` and ``dmn__*`` prefixed tasks
+           from the pending queue, same as before.
 
         Also periodically refreshes the goal-state cache (every 30 s) so
         dialogue-mode turns can inject up-to-date TPN awareness.
         """
         from vingobot.core.pending_queue import PendingQueue
+        from vingobot.goal.dmn_consciousness import DmnConsciousness
 
         queue = PendingQueue()
-        logger.info("[DMN消费者] 已启动")
-        await self._notify_dmn("🟢 DMN 消费者已启动，开始监听认知演化任务。")
+
+        # ── LLM callback wrapper for consciousness ───────────
+        async def _dmn_llm_call(
+            messages: list[dict],
+            temperature: float = 0.7,
+            max_tokens: int = 1024,
+        ) -> str:
+            """Thin wrapper so DmnConsciousness stays provider-agnostic."""
+            response = await self.provider.chat_with_retry(
+                messages=messages,
+                temperature=temperature,
+                max_tokens=max_tokens,
+            )
+            return (response.content or "").strip()
+
+        # ── Lazy-init Guizang consciousness ───────────────────
+        consciousness = DmnConsciousness(
+            workspace=self.workspace,
+            llm_call=_dmn_llm_call,
+        )
+        self._dmn_consciousness = consciousness  # expose for DmnTool introspection
+
+        logger.info("[DMN坤元] 意识模型已启动")
+        await self._notify_dmn("🟢 DMN 坤元意识已启动。八气周天运转中。")
 
         _scan_interval = 30.0  # seconds between goal-state snapshots
+        self._dmn_last_cycle_at = time.monotonic()
 
         while self._running:
-            # ── Consume cognitive-evolution / DMN tasks ──────────
+            # ── 1. 被动任务消费 (backward-compatible) ────────
             claimed = queue.try_consume_by_prefix("cognition-evolution")
             if claimed is None:
                 claimed = queue.try_consume_by_prefix("dmn")
@@ -1107,36 +1140,363 @@ class AgentLoop:
                 try:
                     await self._run_dmn_turn(task.description)
                     await self._notify_dmn(f"✅ 任务完成: {desc}")
+                    # Feed result back to consciousness
+                    consciousness.observe_tpn_task(success=True, summary=desc)
                 except asyncio.CancelledError:
                     await self._notify_dmn(f"⏹ 任务已取消: {desc}")
                     logger.info("[DMN] 学习任务被取消")
-                    # Re-raise so the consumer stops (matches 六爻 WorkerPool pattern).
-                    # The ``finally`` block below still runs to clean up the .processing file.
                     raise
                 except Exception as exc:
                     await self._notify_dmn(f"❌ 任务异常: {desc}\n> {exc}")
                     logger.exception("[DMN] 学习任务异常")
+                    consciousness.observe_tpn_task(success=False, summary=f"{desc}: {exc}")
                 finally:
                     queue.delete_task_file(file_path)
 
-                # Still refresh goal-state cache periodically even when busy
+                # ── 1b. 保底触发: 忙了太久就强制走一次周天 ──
                 now = time.monotonic()
-                if now - self._goal_states_at >= _scan_interval:
+                if now - self._dmn_last_cycle_at >= consciousness.max_wake_interval():
+                    logger.info("[DMN坤元] 保底触发: 已连续忙碌 {:.0f}s", now - self._dmn_last_cycle_at)
+                    await self._run_consciousness_cycle(consciousness, queue)
+
+                # Still refresh goal-state cache periodically even when busy
+                now2 = time.monotonic()
+                if now2 - self._goal_states_at >= _scan_interval:
                     await self._scan_goal_states()
                 continue
 
-            # ── Idle: refresh goal-state cache periodically ─────
+            # ── 2. 空闲触发: 自主意识周天 (one phase per iteration) ──
             now = time.monotonic()
-            if now - self._goal_states_at >= _scan_interval:
+            if now - self._dmn_last_cycle_at >= consciousness.next_wake_interval():
+                await self._run_consciousness_cycle(consciousness, queue)
+
+            # ── 3. Idle: refresh goal-state cache periodically ─
+            now3 = time.monotonic()
+            if now3 - self._goal_states_at >= _scan_interval:
                 await self._scan_goal_states()
 
+            # ── 4. Long-idle sleep to prevent busy-looping ────
+            # TODO: Replace polling with event-driven notification
+            # (PendingQueue.watch() → asyncio.Event/async for)
             try:
-                await asyncio.sleep(1.0)
+                await asyncio.sleep(5.0)
             except asyncio.CancelledError:
                 break
 
-        logger.info("[DMN消费者] 已退出")
-        await self._notify_dmn("⚪ DMN 消费者已停止。")
+        logger.info("[DMN坤元] 意识模型已退出 (周天: {})", consciousness._cycles_completed)
+        await self._notify_dmn("⚪ DMN 坤元意识已停止。")
+        self._dmn_consciousness = None
+
+    async def _run_consciousness_cycle(
+        self, consciousness: object, queue: object
+    ) -> None:
+        """Execute one consciousness cycle and dispatch its result.
+
+        Updates ``self._dmn_last_cycle_at`` on completion so the caller
+        doesn't need to track timing.
+        """
+        try:
+            result = await consciousness.cycle()
+            self._dmn_last_cycle_at = time.monotonic()
+
+            await self._dispatch_consciousness_result(result, queue)
+
+            logger.debug(
+                "[DMN坤元] 周天 {}/{}: 念头={} 偏离={} 归引力={} 行动={}",
+                consciousness._cycles_completed,
+                result.phase.value,
+                getattr(result, "thought_text", "")[:40] or "-",
+                f"{getattr(result, 'deviation_level', 0):.2f}"
+                    if getattr(result, "deviation_level", 0) > 0 else "-",
+                f"{result.gui_gravity:.2f}" if getattr(result, "gui_gravity", None) is not None else "-",
+                "有" if not result.is_resting else "无",
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.exception("[DMN坤元] 意识周天异常")
+
+    async def _enforce_deviation_control(self, deviation: float) -> None:
+        """Deterministic TPN enforcement based on DMN deviation score.
+
+        - deviation > 0.7: write warnings to all active goals' meta.json
+        - deviation > 0.9: additionally pause all active goals and clear queues
+
+        This is SYNC enforcement — no LLM dependency.  The score comes
+        directly from the 八气 operator bit-computation.
+        """
+        from vingobot.core.goal_meta import (
+            get_all_goals,
+            read_goal_meta,
+            update_goal_meta,
+            write_goal_meta,
+        )
+        from vingobot.core.pending_queue import PendingQueue
+
+        try:
+            all_goals = get_all_goals()
+        except Exception:
+            logger.exception("[DMN坤元] 获取目标列表失败，跳过偏离度控制")
+            return
+
+        active_goals = [g for g in all_goals if g.status == "active"]
+        if not active_goals:
+            return
+
+        # ── 0.7 threshold: warnings ─────────────────────────
+        if deviation > 0.7:
+            warning_msg = (
+                f"DMN坤元检测到全局偏离度 {deviation:.2f} (>0.7)"
+                f"，已自动标记警告。请审查目标是否偏离原始意图。"
+            )
+            for goal in active_goals:
+                try:
+                    meta = read_goal_meta(goal.id)
+                    if meta is None:
+                        continue
+                    # Append warning (preserve existing)
+                    existing = list(meta.warnings or [])
+                    if warning_msg not in existing:
+                        existing.append(warning_msg)
+                    meta.warnings = existing
+                    write_goal_meta(goal.id, meta)
+                    logger.warning(
+                        "[DMN坤元] 偏离控制: 目标 {} 已标记警告 (deviation={:.2f})",
+                        goal.id, deviation,
+                    )
+                except Exception:
+                    logger.exception("[DMN坤元] 写入警告失败: {}", goal.id)
+
+        # ── 0.9 threshold: pause + clear queues ──────────────
+        if deviation > 0.9:
+            queue = PendingQueue()
+            for goal in active_goals:
+                try:
+                    update_goal_meta(goal.id, status="paused")
+                    deleted = queue.delete_tasks_for_goal(goal.id)
+                    logger.warning(
+                        "[DMN坤元] 偏离控制: 目标 {} 已暂停，"
+                        "清除 {} 个队列任务 (deviation={:.2f})",
+                        goal.id, deleted, deviation,
+                    )
+                except Exception:
+                    logger.exception("[DMN坤元] 暂停目标失败: {}", goal.id)
+
+    async def _dispatch_consciousness_result(
+        self, result: object, queue: object
+    ) -> None:
+        """Dispatch actions from a ``ConsciousnessResult`` to TPN.
+
+        Converts high-level directives (goal review, blueprint review,
+        evolution actions, subtasks) into enqueued DMN tasks for
+        processing.  LLM-path results carry richer semantic context.
+        """
+        from vingobot.core.pending_queue import PendingTask
+
+        if result.is_resting:
+            return  # Nothing to dispatch
+
+        # ── Deterministic deviation enforcement ──────────────
+        deviation = getattr(result, "deviation_level", 0.0)
+        if result.needs_goal_review and deviation > 0.7:
+            await self._enforce_deviation_control(deviation)
+
+        pending_tasks: list[PendingTask] = []
+
+        # ── Goal review ──────────────────────────────────────
+        if result.needs_goal_review:
+            thought = getattr(result, "thought_text", "")
+            deviation = getattr(result, "deviation_level", 0.0)
+            reason = getattr(result, "deviation_reason", "")
+
+            # Build structured goal list grouped by status
+            goals_by_status = self._build_structured_goal_list()
+
+            desc_parts = [
+                "# 认知演化任务: review_goals",
+                "目标: 全局目标审查",
+            ]
+            if thought:
+                desc_parts.append(f"念头: {thought}")
+            if reason:
+                desc_parts.append(f"偏离原因: {reason}")
+            desc_parts.append(
+                f"描述: DMN坤元意识检测到偏离 (deviation={deviation:.2f})"
+                f"，需要审查所有活跃目标的状态、滞涨情况和资源分配。"
+            )
+            # ── Structured checklist ─────────────────────
+            desc_parts.append("")
+            desc_parts.append("## 强制检查清单")
+            desc_parts.append(
+                "你必须逐项检查并输出结论。不得跳过任何项目："
+            )
+            desc_parts.append(
+                "1. **停滞检测**: 任一目标 last_active 超过 7 天 → "
+                "必须输出 '建议归档' 或 '建议修改计划'"
+            )
+            desc_parts.append(
+                "2. **失败累积**: 任一目标连续 3 次以上任务失败 → "
+                "必须输出 '建议暂停' 或 '建议重设'"
+            )
+            desc_parts.append(
+                "3. **资源冲突**: 同优先级的多个目标争夺资源 → "
+                "必须输出优先级建议"
+            )
+            desc_parts.append(
+                "4. **蓝图偏离**: 目标实际产出与蓝图预期不一致 → "
+                "必须标记 deviation"
+            )
+            desc_parts.append("")
+            desc_parts.append("## 活跃目标状态")
+            desc_parts.append(goals_by_status)
+            pending_tasks.append(PendingTask(
+                goal_id="cognition-evolution",
+                description="\n".join(desc_parts),
+                source="dmn-consciousness",
+                filename_prefix="cognition-evolution__",
+            ))
+
+        # ── Blueprint review ─────────────────────────────────
+        if result.needs_blueprint_review:
+            desc = (
+                "# 认知演化任务: review_blueprint\n"
+                "目标: 蓝图重审\n"
+                "描述: DMN坤元意识建议对活跃目标的蓝图"
+                "进行重新审查，确认完成标准和里程碑是否仍然有效。"
+            )
+            pending_tasks.append(PendingTask(
+                goal_id="cognition-evolution",
+                description=desc,
+                source="dmn-consciousness",
+                filename_prefix="cognition-evolution__",
+            ))
+
+        # ── Subtasks (from 育算子 LLM output) ────────────────
+        for st in (getattr(result, "subtasks", None) or []):
+            if not isinstance(st, dict):
+                continue
+            title = st.get("title", "")
+            desc = st.get("description", "")
+            priority = st.get("priority", 5)
+            intent = getattr(result, "intent_description", "")
+            pending_tasks.append(PendingTask(
+                goal_id="cognition-evolution",
+                description=(
+                    f"# 认知演化任务: 执行子任务\n"
+                    f"目标: {title}\n"
+                    f"意图: {intent[:120] if intent else '来自DMN意识周天'}\n"
+                    f"描述: {desc[:300]}\n"
+                    f"来源: dmn-consciousness"
+                ),
+                source="dmn-consciousness",
+                filename_prefix="cognition-evolution__",
+            ))
+
+        # ── Boundary issues → warn but don't block ───────────
+        for bi in (getattr(result, "boundary_issues", None) or []):
+            if not isinstance(bi, dict):
+                continue
+            logger.warning(
+                "[DMN坤元] 边界问题: subtask={} issue={}",
+                bi.get("subtask", "?"),
+                bi.get("issue", "?"),
+            )
+
+        # ── Evolution actions ────────────────────────────────
+        for ea in (getattr(result, "evolution_actions", None) or []):
+            if not isinstance(ea, dict):
+                continue
+            action = ea.get("action") or ea.get("target") or "learn_skill"
+            target = ea.get("target_name") or ea.get("target") or "unknown"
+            desc = ea.get("description") or ea.get("reason") or ""
+            priority = ea.get("priority", 5)
+            pending_tasks.append(PendingTask(
+                goal_id="cognition-evolution",
+                description=(
+                    f"# 认知演化任务: {action}\n"
+                    f"目标: {target}\n"
+                    f"描述: {desc}\n"
+                    f"来源: dmn-consciousness"
+                ),
+                source="dmn-consciousness",
+                filename_prefix="cognition-evolution__",
+            ))
+
+        # ── Compressed insight (from 藏算子) → log only ─────
+        if compressed := getattr(result, "compressed_insight", ""):
+            logger.info(
+                "[DMN坤元] 认知洞察: {}",
+                compressed[:200],
+            )
+
+        # ── Enqueue all tasks ───────────────────────────────
+        for task in pending_tasks:
+            try:
+                queue.enqueue(task)
+                logger.info(
+                    "[DMN坤元] 派发任务: {} → {}",
+                    task.goal_id,
+                    task.description[:80],
+                )
+            except Exception:
+                logger.exception("[DMN坤元] 派发任务失败")
+
+    def _build_structured_goal_list(self) -> str:
+        """Build a structured goal list grouped by status for DMN review tasks.
+
+        Groups goals into active, paused, and completed buckets, and includes
+        key metadata (priority, last_active, rounds_completed).
+        """
+        try:
+            from vingobot.core.goal_meta import get_all_goals
+            all_goals = get_all_goals()
+        except Exception:
+            return "(无法读取目标状态)"
+
+        if not all_goals:
+            return "(无活跃目标)"
+
+        # Group by status
+        buckets: dict[str, list] = {"active": [], "paused": [], "other": []}
+        for meta in all_goals:
+            status = getattr(meta, "status", "unknown")
+            if status in ("active", "running"):
+                buckets["active"].append(meta)
+            elif status == "paused":
+                buckets["paused"].append(meta)
+            else:
+                buckets["other"].append(meta)
+
+        lines: list[str] = []
+        for bucket_name, bucket_label in [
+            ("active", "活跃目标"),
+            ("paused", "已暂停"),
+            ("other", "其他状态"),
+        ]:
+            goals = buckets[bucket_name]
+            if not goals:
+                continue
+            lines.append(f"### {bucket_label} ({len(goals)})")
+            for meta in goals:
+                traps = len(getattr(meta, "known_traps", None) or [])
+                warnings = len(getattr(meta, "warnings", None) or [])
+                rounds = getattr(meta, "rounds_completed", 0)
+                last_active = getattr(meta, "last_active", "") or "从未激活"
+                if last_active and last_active != "从未激活":
+                    # Truncate timestamp for readability
+                    last_active = last_active[:16]
+                flags = ""
+                if traps:
+                    flags += f" {traps}陷阱"
+                if warnings:
+                    flags += f" {warnings}警告"
+                lines.append(
+                    f"- **{meta.id}**: priority={meta.priority} rounds={rounds}"
+                    f" last_active={last_active}{flags}"
+                )
+            lines.append("")
+
+        return "\n".join(lines) if lines else "(无活跃目标)"
 
     async def _run_dmn_turn(self, task_description: str) -> None:
         """Execute one DMN task by reusing the AgentLoop.

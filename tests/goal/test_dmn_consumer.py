@@ -243,3 +243,299 @@ class TestDmnConsumerLifecycle:
         source = inspect.getsource(AgentLoop.__init__)
         assert "_dmn_consumer_task" in source
         assert "None" in source.split("_dmn_consumer_task")[1][:50]
+
+
+# ---------------------------------------------------------------------------
+# Tests — Pure event-driven DMN loop (no timed polling)
+# ---------------------------------------------------------------------------
+
+
+class TestEventDrivenDmn:
+    """DMN consciousness cycle driven purely by events — no timer, no sleep."""
+
+    @pytest.mark.asyncio
+    async def test_full_zhoutian_event_driven(self) -> None:
+        """一个完整周天由事件驱动完成: 起念→立目标→整理认知→起念."""
+        from vingobot.goal.dmn_consciousness import DmnConsciousness
+        from vingobot.goal.guizang_types import ConsciousnessPhase
+
+        dmn = DmnConsciousness()  # 无 LLM → 位运算降级
+        assert dmn.current_phase == ConsciousnessPhase.QINIAN
+        assert dmn.state.is_resting
+
+        # 事件队列作为唯一的驱动源
+        events: asyncio.Queue[str] = asyncio.Queue()
+        results: list[object] = []
+
+        async def event_loop():
+            """纯事件循环 — 不做任何定时轮询."""
+            while True:
+                try:
+                    event = await asyncio.wait_for(events.get(), timeout=2.0)
+                except asyncio.TimeoutError:
+                    break  # 超时 = 空闲，退出
+
+                if event == "cycle":
+                    result = await dmn.cycle()
+                    results.append(result)
+                    # 事件驱动链：根据结果决定下一步
+                    if not result.is_resting:
+                        events.put_nowait("dispatch")
+                elif event == "dispatch":
+                    # 实际系统中这里会入队 TPN 任务
+                    pass
+                elif event == "tpn_feedback":
+                    dmn.observe_tpn_task(success=True, summary="test")
+                elif event == "stop":
+                    break
+
+        # 启动事件循环并注入 cycle 事件
+        loop_task = asyncio.create_task(event_loop())
+
+        # 注入足够的事件完成一个完整周天
+        for _ in range(6):
+            events.put_nowait("cycle")
+        events.put_nowait("stop")
+
+        await asyncio.wait_for(loop_task, timeout=10.0)
+
+        # 验证 3 个阶段全部执行
+        phases = [r.phase for r in results]
+        assert ConsciousnessPhase.QINIAN in phases
+        assert ConsciousnessPhase.LIMUBIAO in phases
+        assert ConsciousnessPhase.ZHENGLI in phases
+
+        # 整理认知后状态归零
+        assert dmn.state.is_resting
+        assert dmn.state.bits == 0
+        assert dmn._cycles_completed >= 3
+
+    @pytest.mark.asyncio
+    async def test_tpn_feedback_triggers_consolidation(self) -> None:
+        """TPN 任务反馈累积到阈值 → 事件驱动触发整理认知."""
+        from vingobot.goal.dmn_consciousness import (
+            CONSOLIDATE_TRIGGER_TASKS,
+            DmnConsciousness,
+        )
+        from vingobot.goal.guizang_types import ConsciousnessPhase
+
+        dmn = DmnConsciousness()
+        events: asyncio.Queue[str] = asyncio.Queue()
+        results: list[object] = []
+
+        async def event_loop():
+            while True:
+                try:
+                    event = await asyncio.wait_for(events.get(), timeout=2.0)
+                except asyncio.TimeoutError:
+                    break
+                if event == "cycle":
+                    result = await dmn.cycle()
+                    results.append(result)
+                elif event == "tpn_feedback":
+                    dmn.observe_tpn_task(success=True, summary="test")
+                elif event == "stop":
+                    break
+
+        loop_task = asyncio.create_task(event_loop())
+
+        # 注入 TPN 反馈直到触发 consolidate
+        for _ in range(CONSOLIDATE_TRIGGER_TASKS):
+            events.put_nowait("tpn_feedback")
+
+        # Yield to event_loop task so it processes the queued events
+        await asyncio.sleep(0.05)
+
+        # 此时 _phase_pending 应为 ZHENGLI
+        assert dmn.current_phase == ConsciousnessPhase.ZHENGLI
+
+        # 驱动一个 cycle 执行整理认知
+        events.put_nowait("cycle")
+        events.put_nowait("stop")
+
+        await asyncio.wait_for(loop_task, timeout=10.0)
+
+        # 整理认知完成
+        assert any(r.phase == ConsciousnessPhase.ZHENGLI for r in results)
+        # 整理后回到 resting
+        assert dmn.state.is_resting
+
+    @pytest.mark.asyncio
+    async def test_event_loop_no_tasks_no_polling(self) -> None:
+        """事件循环空闲时不消耗 CPU — 等待事件而非轮询."""
+        from vingobot.goal.dmn_consciousness import DmnConsciousness
+
+        dmn = DmnConsciousness()
+        events: asyncio.Queue[str] = asyncio.Queue()
+        cycles_run = 0
+
+        async def event_loop():
+            nonlocal cycles_run
+            while True:
+                try:
+                    # 没有 timeout 时完全阻塞等待 — 纯事件驱动
+                    event = await events.get()
+                except asyncio.CancelledError:
+                    break
+                if event == "cycle":
+                    cycles_run += 1
+                    await dmn.cycle()
+                elif event == "stop":
+                    break
+
+        loop_task = asyncio.create_task(event_loop())
+
+        # 什么也不注入 — 验证循环阻塞在 events.get() 上
+        await asyncio.sleep(0.2)
+        assert cycles_run == 0  # 没有事件 = 没有 cycle
+
+        # 注入事件后才运行
+        events.put_nowait("cycle")
+        events.put_nowait("stop")
+        await asyncio.wait_for(loop_task, timeout=5.0)
+        assert cycles_run == 1
+
+    @pytest.mark.asyncio
+    async def test_multi_zhoutian_event_driven(self) -> None:
+        """多次完整周天事件驱动 — 状态一致性验证."""
+        from vingobot.goal.dmn_consciousness import DmnConsciousness
+        from vingobot.goal.guizang_types import ConsciousnessPhase
+
+        dmn = DmnConsciousness()
+        events: asyncio.Queue[str] = asyncio.Queue()
+        results: list[object] = []
+
+        async def event_loop():
+            while True:
+                try:
+                    event = await asyncio.wait_for(events.get(), timeout=3.0)
+                except asyncio.TimeoutError:
+                    break
+                if event == "cycle":
+                    results.append(await dmn.cycle())
+                elif event == "stop":
+                    break
+
+        loop_task = asyncio.create_task(event_loop())
+
+        # 注入 9 个 cycle 事件 (3 个完整周天)
+        for _ in range(9):
+            events.put_nowait("cycle")
+        events.put_nowait("stop")
+
+        await asyncio.wait_for(loop_task, timeout=10.0)
+
+        assert len(results) == 9
+
+        # 每个周天: 起念→立目标→整理认知
+        for zhoutian_start in range(0, 9, 3):
+            assert results[zhoutian_start].phase == ConsciousnessPhase.QINIAN
+            assert results[zhoutian_start + 1].phase == ConsciousnessPhase.LIMUBIAO
+            assert results[zhoutian_start + 2].phase == ConsciousnessPhase.ZHENGLI
+
+        # 最终状态应归零
+        assert dmn.state.is_resting
+        assert dmn._cycles_completed == 9
+        # 藏海应有记录
+        assert dmn.cang_sea.size > 0
+
+
+# ---------------------------------------------------------------------------
+# Tests — Deviation enforcement (DMN→TPN control bridge)
+# ---------------------------------------------------------------------------
+
+
+class TestDeviationEnforcement:
+    """_enforce_deviation_control writes warnings / pauses goals deterministically.
+
+    NOTE: All goal-meta helpers are imported locally to avoid the
+    Python descriptor protocol binding them as instance methods when
+    accessed via ``self``.
+    """
+
+    @pytest.mark.asyncio
+    async def test_deviation_above_07_writes_warnings(self, tmp_path: Path) -> None:
+        """deviation 0.75 → warnings on all active goals, paused goals untouched."""
+        import vingobot.core.goal_meta as _gm
+        from vingobot.agent.loop import AgentLoop
+
+        root = tmp_path / ".taiji"
+        init_workspace(root, seed=False)
+
+        _gm.write_goal_meta("goal-one", _gm.GoalMeta(id="goal-one", name="one", status="active"))
+        _gm.write_goal_meta("goal-two", _gm.GoalMeta(id="goal-two", name="two", status="paused"))
+
+        loop = AgentLoop.__new__(AgentLoop)
+        await loop._enforce_deviation_control(0.75)
+
+        meta1 = _gm.read_goal_meta("goal-one")
+        assert meta1 is not None
+        assert len(meta1.warnings) >= 1
+        assert "偏离度 0.75" in meta1.warnings[0]
+        assert meta1.status == "active"  # Not paused at 0.75
+
+        meta2 = _gm.read_goal_meta("goal-two")
+        assert meta2 is not None
+        assert meta2.warnings == [] or meta2.warnings is None
+        assert meta2.status == "paused"
+
+    @pytest.mark.asyncio
+    async def test_deviation_above_09_pauses_goals(self, tmp_path: Path) -> None:
+        """deviation 0.95 → warnings + pause all active goals."""
+        import vingobot.core.goal_meta as _gm
+        from vingobot.agent.loop import AgentLoop
+
+        root = tmp_path / ".taiji"
+        init_workspace(root, seed=False)
+
+        _gm.write_goal_meta("goal-one", _gm.GoalMeta(id="goal-one", name="one", status="active"))
+        _gm.write_goal_meta("goal-two", _gm.GoalMeta(id="goal-two", name="two", status="paused"))
+
+        # Enqueue some tasks for the active goal via explicit path
+        test_queue = PendingQueue(root / "pending")
+        test_queue.enqueue(PendingTask(id="t1", goal_id="goal-one", description="task to clear"))
+
+        loop = AgentLoop.__new__(AgentLoop)
+        await loop._enforce_deviation_control(0.95)
+
+        meta1 = _gm.read_goal_meta("goal-one")
+        assert meta1 is not None
+        assert meta1.status == "paused"
+        assert len(meta1.warnings) >= 1
+
+        # Queue should be cleared (PendingQueue() inside enforcement
+        # uses the same workspace root)
+        remaining = test_queue.scan_pending()
+        tasks_for_one = [t for t in remaining if t.goal_id == "goal-one"]
+        assert len(tasks_for_one) == 0
+
+    @pytest.mark.asyncio
+    async def test_deviation_below_07_does_nothing(self, tmp_path: Path) -> None:
+        """deviation 0.3 → no enforcement, goals unchanged."""
+        import vingobot.core.goal_meta as _gm
+        from vingobot.agent.loop import AgentLoop
+
+        root = tmp_path / ".taiji"
+        init_workspace(root, seed=False)
+
+        _gm.write_goal_meta("goal-one", _gm.GoalMeta(id="goal-one", name="one", status="active"))
+
+        loop = AgentLoop.__new__(AgentLoop)
+        await loop._enforce_deviation_control(0.3)
+
+        meta1 = _gm.read_goal_meta("goal-one")
+        assert meta1 is not None
+        assert meta1.warnings == [] or meta1.warnings is None
+        assert meta1.status == "active"
+
+    @pytest.mark.asyncio
+    async def test_no_active_goals_no_error(self, tmp_path: Path) -> None:
+        """Enforcement with no active goals does not crash."""
+        from vingobot.agent.loop import AgentLoop
+
+        root = tmp_path / ".taiji"
+        init_workspace(root, seed=False)
+
+        loop = AgentLoop.__new__(AgentLoop)
+        # Should not raise
+        await loop._enforce_deviation_control(0.85)

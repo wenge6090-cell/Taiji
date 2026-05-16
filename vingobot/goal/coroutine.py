@@ -36,16 +36,20 @@ class WorkerPool:
         max_workers: int = 3,
         poll_interval_ms: int = 500,
         run_task_fn: Callable[[str, str, asyncio.Task | None], Awaitable[object]],
+        on_task_complete: Callable[[str, bool, str], Awaitable[None]] | None = None,
     ) -> None:
         """
         Args:
             max_workers: Maximum concurrent goal-driving workers.
             poll_interval_ms: Idle sleep between queue polls (ms).
             run_task_fn: ``async fn(goal_id, description, signal) -> GoalResult``.
+            on_task_complete: Optional callback ``async fn(goal_id, success, summary)``
+                invoked after each sixiang loop completes.
         """
         self._max_workers = max(max_workers, 1)
         self._poll_interval = max(poll_interval_ms, 100) / 1000.0
         self._run_task_fn = run_task_fn
+        self._on_task_complete = on_task_complete
         self._running = False
         self._workers: list[asyncio.Task[None]] = []
         self._active_goals: dict[str, int] = {}  # goal_id → worker_id
@@ -182,9 +186,28 @@ class WorkerPool:
                 pass
 
             try:
-                await self._run_task_fn(task.goal_id, task.description, asyncio.current_task())
+                result = await self._run_task_fn(task.goal_id, task.description, asyncio.current_task())
+                # ── TPN→DMN feedback ──────────────────────
+                if self._on_task_complete is not None:
+                    success = (
+                        getattr(result, "status", "") == "completed"
+                        if result is not None else False
+                    )
+                    try:
+                        await self._on_task_complete(
+                            task.goal_id, success, task.description[:120],
+                        )
+                    except Exception:
+                        logger.debug("[协程{}] on_task_complete 回调异常", worker_id)
             except asyncio.CancelledError:
                 logger.info("[协程{}] 任务被中断 (goal={})", worker_id, task.goal_id)
+                if self._on_task_complete is not None:
+                    try:
+                        await self._on_task_complete(
+                            task.goal_id, False, f"cancelled: {task.description[:100]}",
+                        )
+                    except Exception:
+                        pass
             except Exception:
                 logger.exception(
                     "[协程{}] 任务失败 (goal={}, desc={})",
@@ -192,6 +215,13 @@ class WorkerPool:
                     task.goal_id,
                     task.description[:80],
                 )
+                if self._on_task_complete is not None:
+                    try:
+                        await self._on_task_complete(
+                            task.goal_id, False, f"error: {task.description[:100]}",
+                        )
+                    except Exception:
+                        pass
             finally:
                 # Cleanup
                 queue.delete_task_file(file_path)

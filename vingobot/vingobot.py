@@ -142,9 +142,23 @@ class vingobot:
         self._sixiang_pool = WorkerPool(
             max_workers=n,
             run_task_fn=execute_complete_sixiang_loop,
+            on_task_complete=self._make_tpn_complete_callback(),
         )
         await self._sixiang_pool.start()
         return self._sixiang_pool
+
+    def _make_tpn_complete_callback(self):
+        """Return an ``on_task_complete`` callback that feeds TPN
+        outcomes back to DMN's 藏海 for Hebbian learning."""
+        async def _on_tpn_complete(goal_id: str, success: bool, summary: str) -> None:
+            loop = getattr(self, "_loop", None)
+            if loop is None:
+                return
+            consciousness = getattr(loop, "_dmn_consciousness", None)
+            if consciousness is not None:
+                consciousness.observe_tpn_task(success=success, summary=summary)
+
+        return _on_tpn_complete
 
     async def stop_sixiang(self) -> None:
         """Stop the sixiang coroutine pool if running."""

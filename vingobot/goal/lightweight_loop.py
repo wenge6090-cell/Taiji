@@ -36,6 +36,10 @@ _MINGJUE_MAX_ROUNDS = 2
 _ANQU_MAX_ROUNDS = 5
 """暗驱验证最多轮次。"""
 
+_SIBIAN_MAX_ROUNDS = 2
+"""思变评估最多轮次。"""
+
+
 _LIGHTWEIGHT_TOOLS: list[str] = [
     "read_file",
     "list_directory",
@@ -67,6 +71,35 @@ class LightweightLoopResult:
 # ---------------------------------------------------------------------------
 # 公开 API
 # ---------------------------------------------------------------------------
+
+
+async def run_sibian_loop(
+    *,
+    task_dir: str | Path,
+    system_prompt: str,
+    goal_dir: str | None = None,
+    cognition_dirs: list[str] | None = None,
+    signal: asyncio.Task | None = None,
+    provider: Any = None,
+) -> LightweightLoopResult:
+    """运行思变的只读评估循环。
+
+    思变评估跨任务执行模式（失败率、滞涨、方向偏离），
+    判断蓝图是否需要修订。配有 exec 和 write_file 能力，
+    可验证产出物和写入蓝图修订建议。
+    """
+    return await _run_lightweight_core(
+        task_dir=task_dir,
+        system_prompt=system_prompt,
+        goal_dir=goal_dir,
+        cognition_dirs=cognition_dirs,
+        max_rounds=_SIBIAN_MAX_ROUNDS,
+        agent_label="思变",
+        temperature=0.3,
+        signal=signal,
+        provider=provider,
+        extra_tool_names=["exec", "write_file"],
+    )
 
 
 async def run_mingjue_loop(
@@ -140,11 +173,15 @@ async def _run_lightweight_core(
     temperature: float = 0.5,
     signal: asyncio.Task | None = None,
     provider: Any = None,
+    extra_tool_names: list[str] | None = None,
 ) -> LightweightLoopResult:
     """共享的只读探索-决策循环引擎。
 
     每轮：Yang（LLM）→ 阴（审批）→ 执行器（只读工具）。工具只有
     read_file / list_directory 等纯查询操作，阴直接放行。
+
+    extra_tool_names: 额外工具名列表（如 exec, write_file），用于 Sibian
+        等需要写权限的特殊节点。
     """
 
     task_dir = Path(task_dir)
@@ -152,7 +189,7 @@ async def _run_lightweight_core(
         raise FileNotFoundError(f"task_dir 不存在: {task_dir}")
 
     # ── 构建轻量工具定义 ──────────────────────────────────────
-    tool_defs = _build_lightweight_tool_defs()
+    tool_defs = _build_lightweight_tool_defs(extra_tool_names=extra_tool_names)
 
     # ── 历史跟踪 ──────────────────────────────────────────
     previous_invoke_results = ""
@@ -262,7 +299,7 @@ async def _run_lightweight_core(
             continue
 
         # ── 阴（审批）─────────────────────────────────────────
-        approved_calls, _yin_decision, _yin_reason = await approve(
+        approved_calls, _yin_decision, _yin_reason, _ = await approve(
             yang_response.tool_calls,
             workspace_root=task_dir,
         )
@@ -334,12 +371,18 @@ async def _run_lightweight_core(
 # ---------------------------------------------------------------------------
 
 
-def _build_lightweight_tool_defs() -> list[dict[str, Any]]:
-    """从 Weaver 的 _BASE_TOOL_DEFS 中提取只读工具定义。"""
+def _build_lightweight_tool_defs(
+    extra_tool_names: list[str] | None = None,
+) -> list[dict[str, Any]]:
+    """从 Weaver 的 _BASE_TOOL_DEFS 中提取工具定义。"""
     from vingobot.goal.weaver import _BASE_TOOL_DEFS
 
+    tool_names = list(_LIGHTWEIGHT_TOOLS)
+    if extra_tool_names:
+        tool_names.extend(extra_tool_names)
+
     defs: list[dict[str, Any]] = []
-    for name in _LIGHTWEIGHT_TOOLS:
+    for name in tool_names:
         if name in _BASE_TOOL_DEFS:
             defs.append(_BASE_TOOL_DEFS[name])
     return defs
@@ -388,7 +431,7 @@ def _save_round_output(task_dir: Path, agent_label: str, round_num: int, data: d
     out_dir = task_dir / "outputs"
     out_dir.mkdir(exist_ok=True)
     # 将中文标签转换为安全的文件前缀
-    label_map = {"明觉": "mingjue", "暗驱": "anqu"}
+    label_map = {"明觉": "mingjue", "暗驱": "anqu", "思变": "sibian"}
     prefix = label_map.get(agent_label, agent_label)
     fn = f"{prefix}-{round_num:03d}-round.json"
     try:

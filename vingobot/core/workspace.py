@@ -230,6 +230,7 @@ def ensure_goal_dir(
         "created_at": now,
         "last_active": now,
         "self_driven": {"enabled": False, "interval_minutes": 30},
+        "known_traps": [],
     }
     (goal_dir / "meta.json").write_text(
         json.dumps(meta, ensure_ascii=False, indent=2), encoding="utf-8"

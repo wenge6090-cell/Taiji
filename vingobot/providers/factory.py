@@ -142,7 +142,7 @@ def build_sixiang_provider_snapshot(config: Config, agent_name: str) -> Provider
 
     Args:
         config: Full configuration.
-        agent_name: One of ``mingjue``, ``weaver``, ``yang``, ``yin``, ``anqu``.
+        agent_name: One of ``mingjue``, ``weaver``, ``yang``, ``yin``, ``action``, ``anqu``.
     """
     agent_cfg = config.agents.defaults.sixiang.agents.get(agent_name)
     model = agent_cfg.model if (agent_cfg and agent_cfg.model) else config.agents.defaults.model

@@ -39,6 +39,7 @@ class PendingTask:
     source: TaskSource = "user"
     created_at: str = ""
     metadata: dict[str, Any] = field(default_factory=dict)
+    filename_prefix: str = ""
 
     def to_file_content(self) -> str:
         """Serialise the task to the flat ``.task`` file format."""
@@ -121,9 +122,10 @@ class PendingQueue:
         partial writes and accidental overwrites of concurrently-created
         files.
         """
+        prefix = task.filename_prefix or ""
         ts = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S")
         safe_desc = re.sub(r"[^a-zA-Z0-9\u4e00-\u9fa5]", "-", task.description[:30])
-        filename = f"{ts}_{safe_desc}.task"
+        filename = f"{prefix}{ts}_{safe_desc}.task"
         filepath = self.pending_dir / filename
 
         try:
@@ -140,7 +142,7 @@ class PendingQueue:
 
             time.sleep(0.002)
             ts2 = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%f")
-            filename2 = f"{ts2}_{safe_desc}.task"
+            filename2 = f"{prefix}{ts2}_{safe_desc}.task"
             filepath2 = self.pending_dir / filename2
             tmp_path2 = filepath2.with_suffix(".tmp")
             tmp_path2.write_text(task.to_file_content(), encoding="utf-8")
@@ -206,6 +208,17 @@ class PendingQueue:
             processing_path.unlink(missing_ok=True)
         return None
 
+    def has_pending_by_prefix(self, prefix: str) -> bool:
+        """Check whether any ``.task`` file starts with *prefix*.
+
+        Lightweight check — does NOT claim or rename any file.
+        Useful for idle-detection logic before attempting a consume.
+        """
+        for fp in self._scan_task_files(".task"):
+            if fp.name.startswith(prefix):
+                return True
+        return False
+
     def try_consume_by_prefix(self, prefix: str) -> tuple[PendingTask, Path] | None:
         """Atomically claim a task whose filename starts with *prefix*.
 
@@ -240,6 +253,28 @@ class PendingQueue:
         task_path = path.with_suffix(".task")
         task_path.unlink(missing_ok=True)
         path.unlink(missing_ok=True)
+
+    def delete_tasks_for_goal(self, goal_id: str) -> int:
+        """Delete all ``.task`` and ``.processing`` files for *goal_id*.
+
+        Returns the number of files deleted.
+        """
+        self.pending_dir.mkdir(parents=True, exist_ok=True)
+        deleted = 0
+        for sfx in (".task", ".processing"):
+            for fp in list(self.pending_dir.glob(f"*{sfx}")):
+                try:
+                    task = PendingTask.from_file(fp, fp.name)
+                except Exception:
+                    logger.debug("[队列] 解析任务失败: {}", fp)
+                    continue
+                if task is not None and task.goal_id == goal_id:
+                    try:
+                        fp.unlink()
+                        deleted += 1
+                    except OSError:
+                        logger.debug("[队列] 删除任务失败: {}", fp)
+        return deleted
 
     # ------------------------------------------------------------------
     # Dedup

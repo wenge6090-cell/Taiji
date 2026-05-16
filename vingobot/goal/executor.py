@@ -1,16 +1,16 @@
 """
-五爻·执行器 — Final protection line for tool execution.
+四爻·执行器 — Trusted tool execution engine.
 
-The Executor receives the approved tool calls from Yin and executes them
-with hard-coded safety checks as the last line of defense:
+The Executor receives the approved tool calls from Yin and executes them.
+Since Yin performs all safety checks during approval (path traversal, exec
+allowlist, cognitive layer protection), the Executor trusts those decisions
+and focuses on:
 
-1. **Path traversal re-check** — Double-check against ``..`` and abs paths.
-2. **Command allowlist re-verify** — Second pass on exec safety.
-3. **Rate limiting** — Simple per-tool invocation cap per round.
-4. **Concurrent execution** — All approved calls run concurrently via
+1. **Rate limiting** — Simple per-tool invocation cap per round.
+2. **Concurrent execution** — All approved calls run concurrently via
    ``asyncio.gather``, since they target independent paths and each
-   ``_execute_one`` is error-isolated.
-5. **Result packaging** — Results formatted for the next round's facts.
+   ``execute_single_call`` is error-isolated.
+3. **Result packaging** — Results formatted for the next round's facts.
 
 Tool execution is delegated to ``vingobot.core.tool_executor`` (shared between
 AgentLoop and sixiang processes), eliminating the previous reverse import
@@ -30,23 +30,16 @@ from vingobot.core.tool_executor import (
 )
 from vingobot.goal.types import ApprovedToolCall, ExecutionResult
 from vingobot.goal.types import SixiangPermissionConfig
-from vingobot.goal.yin import _check_path_safety as _yin_check_path_safety
-from vingobot.goal.yin import _check_exec_safety as _yin_check_exec_safety
 
 # ---------------------------------------------------------------------------
 # Rate limiting
 # ---------------------------------------------------------------------------
 
-_MAX_CALLS_PER_ROUND = 10
+_MAX_CALLS_PER_ROUND = 20
 """Maximum number of approved calls per round (hard limit)."""
 
-_MAX_CONCURRENT_TOOLS = 10
-"""Maximum concurrent tool calls within a single round.
-
-Matches _MAX_CALLS_PER_ROUND so every approved call runs immediately
-(no queuing). 10 concurrent disk/network operations are well within
-modern system tolerances.
-"""
+_MAX_CONCURRENT_TOOLS = 20
+"""Maximum concurrent tool calls within a single round."""
 
 _tool_gate: asyncio.Semaphore | None = None
 
@@ -102,7 +95,7 @@ async def execute_tool_calls(
 
     async def _guarded(c: ApprovedToolCall) -> ExecutionResult:
         async with gate:
-            return await _execute_one(
+            return await execute_single_call(
                 c, task_dir=task_dir, goal_dir=goal_dir,
                 cognition_dirs=cognition_dirs, perm=perm,
             )
@@ -114,7 +107,7 @@ async def execute_tool_calls(
             logger.warning("[执行器] 内部异常: {}", result)
             # Create a synthetic failure result (we lost the original call identity)
             # asyncio.gather with return_exceptions=True should not raise for a single
-            # _execute_one since it catches its own errors; this is pure defense.
+            # execute_single_call since it catches its own errors; this is pure defense.
             results.append(ExecutionResult(
                 call=ApprovedToolCall(name="<unknown>", arguments={}),
                 status="error",
@@ -132,7 +125,7 @@ async def execute_tool_calls(
 # ---------------------------------------------------------------------------
 
 
-async def _execute_one(
+async def execute_single_call(
     call: ApprovedToolCall,
     task_dir: str | Path | None = None,
     goal_dir: str | Path | None = None,
@@ -160,77 +153,21 @@ async def _execute_one(
         exec_cwds = [Path(task_dir)] if task_dir else []
         yin_root = Path(task_dir) if task_dir else None
 
-    # Final path safety re-check for IO tools (uses Yin's comprehensive checks)
-    if tool_name in ("write_file", "read_file", "delete_file", "edit_file"):
-        path_str = args.get("path", "")
-        if path_str:
-            is_read_op = tool_name in ("read_file",)
-            if is_read_op and read_allowed:
-                # Check against each read-only allowed dir
-                safe = False
-                for allowed in read_allowed:
-                    chk_safe, _ = _yin_check_path_safety(
-                        path_str,
-                        workspace_root=allowed,
-                        for_write=False,
-                    )
-                    if chk_safe:
-                        safe = True
-                        break
-                if not safe:
-                    # Fall through to task_dir check
-                    chk_safe, reason = _yin_check_path_safety(
-                        path_str,
-                        workspace_root=yin_root,
-                        for_write=False,
-                    )
-                    if not chk_safe:
-                        return ExecutionResult(
-                            call=call,
-                            status="blocked",
-                            output="",
-                            error=f"[最终防线] {reason}",
-                        )
-            else:
-                # Write operations: check against write_allowed targets
-                safe = False
-                for target in (write_allowed if write_allowed else [yin_root]):
-                    chk_safe, reason = _yin_check_path_safety(
-                        path_str,
-                        workspace_root=target,
-                        for_write=True,
-                    )
-                    if chk_safe:
-                        safe = True
-                        break
-                if not safe:
-                    return ExecutionResult(
-                        call=call,
-                        status="blocked",
-                        output="",
-                        error=f"[最终防线] {reason}",
-                    )
-
-    # Final exec safety re-check (with workspace boundary)
-    if tool_name == "exec":
-        cmd = args.get("command", "")
-        cwd = args.get("cwd", "")
-        if cmd:
-            safe, reason = _yin_check_exec_safety(
-                cmd, cwd, workspace_root=yin_root,
-            )
-            if not safe:
-                return ExecutionResult(
-                    call=call,
-                    status="blocked",
-                    output="",
-                    error=f"[最终防线] {reason}",
-                )
-
-    # Try skill tool routing (L3 grid discovered tools)
+    # Route to skill tool or builtin executor
     skill_result = await _try_skill_tool(tool_name, call, args)
     if skill_result is not None:
         return skill_result
+
+    # ── Minimal path-traversal guard (Yin does the heavy lifting) ─────
+    if tool_name in ("write_file", "read_file", "delete_file", "edit_file"):
+        path_str = args.get("path", "")
+        if path_str and ".." in path_str:
+            return ExecutionResult(
+                call=call,
+                status="blocked",
+                output="",
+                error=f"[执行器] 路径穿越检测: .. 禁止 ({path_str})",
+            )
 
     # Fallback: delegate to shared builtin executor
     try:

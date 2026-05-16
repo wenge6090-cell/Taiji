@@ -147,6 +147,7 @@ EvolutionActionType = Literal[
     "create_grid",
     "research",
     "investigate",
+    "review_blueprint",
 ]
 
 

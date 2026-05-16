@@ -119,16 +119,35 @@ class StreamRenderer:
 
     async def on_end(self, *, resuming: bool = False) -> None:
         if self._live:
-            self._live.update(self._render())
-            self._live.refresh()
-            self._live.stop()
-            self._live = None
+            try:
+                self._live.update(self._render())
+                self._live.refresh()
+            finally:
+                self._live.stop()
+                # Explicitly show cursor after Live.stop() — Rich may fail
+                # to restore it if the terminal state was corrupted by
+                # prompt_toolkit's raw-mode toggling across turns (#3370).
+                try:
+                    self._live.console.show_cursor()
+                except Exception:
+                    pass
+                self._live = None
+                # Flush stdout to prevent stale escape codes from bleeding
+                # into the next turn's output.
+                try:
+                    sys.stdout.flush()
+                except Exception:
+                    pass
         self._stop_spinner()
         if resuming:
             self._buf = ""
             self._start_spinner()
         else:
             _make_console().print()
+            try:
+                sys.stdout.flush()
+            except Exception:
+                pass
 
     def stop_for_input(self) -> None:
         """Stop spinner before user input to avoid prompt_toolkit conflicts."""
@@ -137,6 +156,16 @@ class StreamRenderer:
     async def close(self) -> None:
         """Stop spinner/live without rendering a final streamed round."""
         if self._live:
-            self._live.stop()
-            self._live = None
+            try:
+                self._live.stop()
+                try:
+                    self._live.console.show_cursor()
+                except Exception:
+                    pass
+            finally:
+                self._live = None
+            try:
+                sys.stdout.flush()
+            except Exception:
+                pass
         self._stop_spinner()

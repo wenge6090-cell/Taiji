@@ -83,8 +83,9 @@ class TpnTool(Tool):
 
     * **update** — Update a goal's metadata.  You can change status
       ("active" / "paused" / "completed" / "archived"), priority,
-      description, or self-driven settings.  Only the fields you
-      provide are changed; others stay the same.
+      description, self-driven settings, or known_traps (per-goal
+      anti-pattern table).  Only the fields you provide are changed;
+      others stay the same.
 
     * **delete** — Delete a goal and all its tasks.  This is
       irreversible — warn the user first.
@@ -169,6 +170,20 @@ class TpnTool(Tool):
                     "minimum": 1,
                     "maximum": 1440,
                     "description": "Self-driven wake interval in minutes.",
+                },
+                "known_traps": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "name": {"type": "string", "description": "Trap name (snake_case)"},
+                            "description": {"type": "string", "description": "What the trap is"},
+                            "trigger": {"type": "string", "description": "When it triggers"},
+                            "response": {"type": "string", "description": "How to avoid it"},
+                            "added_by": {"type": "string", "description": "Who added it (dmn/manual)"},
+                        },
+                    },
+                    "description": "Per-goal known anti-patterns to avoid (for update).",
                 },
             },
             "required": ["action"],
@@ -537,6 +552,16 @@ class TpnTool(Tool):
                 changes.append(
                     f"自驱: enabled={new_sd.enabled}, interval={new_sd.interval_minutes}min"
                 )
+
+            # ── Known traps (per-goal anti-pattern table) ──
+            if "known_traps" in kwargs and kwargs["known_traps"] is not None:
+                new_traps = list(kwargs["known_traps"])
+                if new_traps != meta.known_traps:
+                    meta.known_traps = new_traps
+                    from vingobot.core.goal_meta import write_goal_meta
+
+                    write_goal_meta(goal_id, meta)
+                    changes.append(f"已知陷阱: {len(meta.known_traps)} 个陷阱 → {len(new_traps)} 个陷阱")
 
             if updates:
                 update_goal_meta(goal_id, **updates)

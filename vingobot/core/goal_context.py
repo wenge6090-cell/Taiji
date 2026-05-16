@@ -29,6 +29,7 @@ class GoalContextMeta:
     status: str = "active"
     priority: int = 5
     self_driven: bool = False
+    known_traps: list[dict] = field(default_factory=list)
 
 
 @dataclass
@@ -48,6 +49,7 @@ class GoalContext:
     memory_summary: str = ""
     trajectory_snapshot: str = ""
     recent_task_statuses: list[RecentTaskStatus] = field(default_factory=list)
+    known_traps_text: str = ""
 
 
 # ---------------------------------------------------------------------------
@@ -73,11 +75,13 @@ def load_goal_context(goal_id: str) -> GoalContext | None:
             status=meta.status,
             priority=meta.priority,
             self_driven=meta.self_driven.enabled,
+            known_traps=meta.known_traps,
         ),
         blueprint_summary=_read_blueprint_summary(goal_dir),
         memory_summary=_read_memory_summary(goal_dir),
         trajectory_snapshot=read_progress_snapshot(goal_id),
         recent_task_statuses=_read_recent_task_statuses(goal_dir),
+        known_traps_text=_format_known_traps(meta.known_traps),
     )
 
 
@@ -102,7 +106,7 @@ def _read_blueprint_summary(goal_dir: Path) -> str:
 
 
 def _read_memory_summary(goal_dir: Path) -> str:
-    """Read the last 5 goal-memory entries (both .json and .md).
+    """Read the last 10 goal-memory entries (both .json and .md).
 
     For .json entries the key fields are formatted as readable text.
     For .md entries the first 3 non-header lines are used.
@@ -115,7 +119,7 @@ def _read_memory_summary(goal_dir: Path) -> str:
         files = sorted(
             p for p in memory_dir.iterdir()
             if p.is_file() and p.suffix in (".json", ".md")
-        )[-5:]
+        )[-10:]
     except OSError:
         return ""
 
@@ -197,3 +201,26 @@ def _read_recent_task_statuses(goal_dir: Path) -> list[RecentTaskStatus]:
             summary_snippet=snippet,
         ))
     return result
+
+
+def _format_known_traps(traps: list[dict]) -> str:
+    """Format the known_traps list into a readable prompt section.
+
+    Returns an empty string when there are no traps.
+    """
+    if not traps:
+        return ""
+    lines = ["## 目标已知陷阱（以下策略已被证明无效，必须避免）"]
+    for i, trap in enumerate(traps, 1):
+        name = trap.get("name", f"trap-{i}")
+        desc = trap.get("description", "")
+        trigger = trap.get("trigger", "")
+        response = trap.get("response", "")
+        lines.append(f"\n### 陷阱 {i}: {name}")
+        if desc:
+            lines.append(f"- 描述: {desc}")
+        if trigger:
+            lines.append(f"- 触发条件: {trigger}")
+        if response:
+            lines.append(f"- 应对策略: {response}")
+    return "\n".join(lines)

@@ -16,8 +16,8 @@ single round of the inner loop:
 
 L3 Grid integration:
 - ``_discover_skill_tools()`` reads the trigram's grid JSON and loads
-  tool definitions from referenced L1 skills (their ``SKILL.md``), plus
-  experience model content from referenced L2 models.
+  tool definitions from referenced L1 skills (their ``SKILL.md``).
+  L2 models are handled by 思变 (Sibian), not by Weaver.
 - Workflow steps from the grid are injected into the system prompt as
   execution guidance.
 """
@@ -78,25 +78,79 @@ _TRIGRAM_TOOLS: dict[str, list[str]] = {
         "query_capabilities",
         "task_complete",
     ],
-    "kun": ["read_file", "list_directory", "write_file", "edit_file", "exec", "query_capabilities", "task_complete"],
-    "zhen": ["read_file", "list_directory", "write_file", "edit_file", "exec", "query_capabilities", "task_complete"],
+    "kun": [
+        "read_file",
+        "list_directory",
+        "write_file",
+        "edit_file",
+        "exec",
+        "web_search",
+        "web_fetch",
+        "query_capabilities",
+        "task_complete",
+    ],
+    "zhen": [
+        "read_file",
+        "list_directory",
+        "write_file",
+        "edit_file",
+        "exec",
+        "web_search",
+        "web_fetch",
+        "query_capabilities",
+        "task_complete",
+    ],
     "xun": [
         "read_file",
         "list_directory",
+        "write_file",
+        "edit_file",
         "web_search",
+        "web_fetch",
         "query_capabilities",
         "task_complete",
     ],
     "kan": [
         "read_file",
         "list_directory",
+        "write_file",
+        "edit_file",
         "exec",
+        "web_search",
+        "web_fetch",
         "query_capabilities",
         "task_complete",
     ],
-    "li": ["read_file", "list_directory", "write_file", "edit_file", "query_capabilities", "task_complete"],
-    "gen": ["read_file", "list_directory", "query_capabilities", "task_complete"],
-    "dui": ["read_file", "list_directory", "write_file", "edit_file", "query_capabilities", "task_complete"],
+    "li": [
+        "read_file",
+        "list_directory",
+        "write_file",
+        "edit_file",
+        "exec",
+        "web_search",
+        "web_fetch",
+        "query_capabilities",
+        "task_complete",
+    ],
+    "gen": [
+        "read_file",
+        "list_directory",
+        "write_file",
+        "edit_file",
+        "query_capabilities",
+        "task_complete",
+    ],
+    "dui": [
+        "read_file",
+        "list_directory",
+        "write_file",
+        "edit_file",
+        "exec",
+        "web_search",
+        "web_fetch",
+        "query_capabilities",
+        "task_complete",
+    ],
 }
 
 # Base tool definitions (minimal — full definitions fetched from registry at runtime)
@@ -287,26 +341,27 @@ _BASE_TOOL_DEFS: dict[str, dict[str, Any]] = {
 # L3 Grid discovery cache
 # ---------------------------------------------------------------------------
 
-_grid_discovery_cache: dict[str, tuple[list[dict[str, Any]], str, str]] = {}
+_grid_discovery_cache: dict[str, tuple[list[dict[str, Any]], str, list[str]]] = {}
 
 
-def _discover_skill_tools(trigram: str) -> tuple[list[dict[str, Any]], str, str]:
-    """Discover L1 skill tools + L2 model content from the trigram's L3 grid.
+def _discover_skill_tools(trigram: str) -> tuple[list[dict[str, Any]], str, list[str]]:
+    """Discover L1 skill tools from the trigram's L3 grid.
 
     Reads the grid JSON at ``<workspace>/.taiji/cognition/grids/<trigram相关的grid>.json``,
-    resolves referenced skills (tool definitions) and models (formatted content).
+    resolves referenced skills (tool definitions) only.
+    L2 models are handled by 思变 (Sibian), not by Weaver.
 
     Returns:
-        (tool_definitions, workflow_guidance, model_content)
+        (tool_definitions, workflow_guidance, skill_names)
     """
     # Check cache first (per trigram, per session)
     cached = _grid_discovery_cache.get(trigram)
     if cached is not None:
-        return cached
+        return cached  # type: ignore[return-value]
 
     discovered_tools: list[dict[str, Any]] = []
     workflow_guidance = ""
-    model_content = ""
+    skill_names: list[str] = []
 
     try:
         from vingobot.core.workspace import get_workspace_paths
@@ -316,7 +371,7 @@ def _discover_skill_tools(trigram: str) -> tuple[list[dict[str, Any]], str, str]
         grids_dir = wp.grids
 
         if not grids_dir.is_dir():
-            return [], "", ""
+            return [], "", []
 
         # Try to find grid files matching this trigram
         grid_files = list(grids_dir.glob("*.json"))
@@ -332,8 +387,8 @@ def _discover_skill_tools(trigram: str) -> tuple[list[dict[str, Any]], str, str]
                 continue
 
         if trigram_grid is None:
-            _grid_discovery_cache[trigram] = ([], "", "")
-            return [], "", ""
+            _grid_discovery_cache[trigram] = ([], "", [])
+            return [], "", []
 
         # Build workflow guidance
         if trigram_grid.workflow:
@@ -355,14 +410,12 @@ def _discover_skill_tools(trigram: str) -> tuple[list[dict[str, Any]], str, str]
 
             tool_defs = _load_skill_tools(skill_name, skill_dir)
             discovered_tools.extend(tool_defs)
-
-        # Load experience model content from grid's model references
-        model_content = _load_grid_models(wp.models, trigram_grid.models)
+            skill_names.append(skill_name)
 
     except Exception as exc:
         logger.warning("[编织] 发现L3格栅技能工具失败: {}", exc)
 
-    result = (discovered_tools, workflow_guidance, model_content)
+    result = (discovered_tools, workflow_guidance, skill_names)
     _grid_discovery_cache[trigram] = result
     return result
 
@@ -374,13 +427,17 @@ def _load_skill_tools(
     """Load tool definitions from a skill's SKILL.md using skill_parser.
 
     Parses the YAML frontmatter, converts each tool to OpenAI schema,
-    and registers them in the global skill tool registry for Executor routing.
+    registers them in the global skill tool registry for Executor routing,
+    and loads the skill's ``_executor.py`` if present.
     """
     from vingobot.goal.skill_parser import parse_skill_md, register_skill_tools_from_meta
 
     skill_md = skill_dir / "SKILL.md"
     if not skill_md.is_file():
         return []
+
+    # ── Load the skill's executor module (auto-registers on import) ──
+    _try_load_skill_executor(skill_dir)
 
     meta = parse_skill_md(skill_md)
     if meta is None:
@@ -393,100 +450,32 @@ def _load_skill_tools(
     return [t.to_openai_tool_def() for t in meta.tools]
 
 
-def _load_grid_models(models_dir: Path, model_refs: list) -> str:
-    """Load and format L2 experience model files referenced by the grid.
+def _try_load_skill_executor(skill_dir: Any) -> None:
+    """Attempt to import a skill's ``_executor`` module for auto-registration.
 
-    Reads model files (``.json`` or ``.md``) from
-    ``<workspace>/.taiji/cognition/models/`` and returns a formatted section
-    string for the system prompt.
-
-    Returns:
-        Empty string if no models found or no models directory.
+    Skills can ship an ``_executor.py`` file that auto-registers async
+    executor callables on import via ``register_skill_executor()``.
+    This function triggers that import so the executors are available
+    when Yang calls the skill's tools.
     """
-    if not model_refs or not models_dir.is_dir():
-        return ""
+    executor_file = Path(str(skill_dir)) / "_executor.py"
+    if not executor_file.is_file():
+        return
 
-    entries: list[str] = []
-
-    for ref in model_refs:
-        model_name = ref.name if hasattr(ref, 'name') else str(ref)
-        if not model_name:
-            continue
-
-        # Try .json then .md
-        model_file = None
-        for ext in (".json", ".md"):
-            candidate = models_dir / f"{model_name}{ext}"
-            if candidate.is_file():
-                model_file = candidate
-                break
-
-        if model_file is None:
-            logger.debug("[编织] L3网格引用的模型 '{}' 不存在", model_name)
-            continue
-
-        try:
-            raw = model_file.read_text(encoding="utf-8")
-            if model_file.suffix == ".json":
-                content = _format_json_model(raw, model_name)
-            else:
-                content = raw[:500]
-            entries.append(f"### {model_name}\n{content}")
-        except Exception as exc:
-            logger.debug("[编织] 读取模型 '{}' 失败: {}", model_name, exc)
-
-    if not entries:
-        return ""
-
-    return "## 相关经验模型\n\n" + "\n\n".join(entries)
-
-
-
-def _format_json_model(raw: str, model_name: str) -> str:
-    """Format a JSON model file into readable text for system prompt."""
+    # Derive the dotted module path from the file path
+    # e.g. .../skills/remotion-video/_executor.py → _executor
     try:
-        data = json.loads(raw)
-    except json.JSONDecodeError:
-        return raw[:500]
-
-    parts: list[str] = []
-    desc = data.get("description", "")
-    if desc:
-        parts.append(f"**描述**: {desc}")
-
-    pattern = data.get("pattern", {})
-    if isinstance(pattern, dict):
-        phases = pattern.get("phases", [])
-        if isinstance(phases, list):
-            parts.append("**模式阶段**:")
-            for phase in phases:
-                if isinstance(phase, dict):
-                    phase_name = phase.get("phase", "")
-                    steps = phase.get("steps", [])
-                    parts.append(f"- **{phase_name}**")
-                    for step in (steps or []):
-                        parts.append(f"  - {step}")
-
-        when_use = pattern.get("when_to_use", [])
-        if isinstance(when_use, list) and when_use:
-            parts.append("**适用场景**:")
-            for item in when_use:
-                parts.append(f"- {item}")
-
-        when_not = pattern.get("when_not_to_use", [])
-        if isinstance(when_not, list) and when_not:
-            parts.append("**不适用场景**:")
-            for item in when_not:
-                parts.append(f"- {item}")
-
-    anti = data.get("anti_patterns", [])
-    if isinstance(anti, list) and anti:
-        parts.append("**反模式**:")
-        for item in anti:
-            parts.append(f"- {item}")
-
-    return "\n".join(parts)
-
+        import importlib.util
+        spec = importlib.util.spec_from_file_location(
+            f"vingobot_skill_{executor_file.parent.name}",
+            str(executor_file),
+        )
+        if spec and spec.loader:
+            module = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(module)
+            logger.debug("[编织] 已加载技能执行器: {}", executor_file.parent.name)
+    except Exception as exc:
+        logger.debug("[编织] 加载技能执行器失败 {}: {}", executor_file.parent.name, exc)
 
 
 def clear_grid_discovery_cache() -> None:
@@ -552,8 +541,8 @@ async def weave(
         round_num,
     )
 
-    # 4. Discover L3 grid skill tools (model content is now lazy, accessed by Yang)
-    skill_tools, workflow_guidance, _model_content = _discover_skill_tools(trigram)
+    # 4. Discover L3 grid skill tools (L1 only; L2 models are handled by 思变)
+    skill_tools, workflow_guidance, discovered_skill_names = _discover_skill_tools(trigram)
 
     # 5. Build full system prompt
     system_prompt = _build_system_prompt_v2(
@@ -577,16 +566,33 @@ async def weave(
         f"\n（以上为 Weaver 认知决策引擎的输出，供你参考当前任务阶段的执行姿态，不构成强制指令。）"
     )
 
-    # 7a. Cognitive asset path guidance (let Yang self-discover)
+    # 7a. Cognitive asset path guidance (mandatory skill usage)
     trigram_label = mingjue.trigram or "kun"
-    system_prompt += (
-        f"\n\n## 认知资产指引\n"
-        f"当前卦象 {trigram_label}卦 对应的认知资产可通过以下路径按需访问：\n"
-        f"- L3 网格: 用 `list_directory` 浏览 grids/ 目录，`read_file` 读取匹配 {trigram_label} 卦的 JSON 网格文件获取完整 workflow\n"
-        f"- L2 模型: 用 `list_directory` 浏览 models/ 目录查看可用经验模型，用 `read_file` 读取 .json 或 .md 文件\n"
-        f"- L1 技能: 用 `list_directory` 浏览 skills/ 目录查看可用技能\n"
-        f"遇到特定问题模式时再查阅相关认知资产，不必提前加载全部。"
-    )
+    if discovered_skill_names:
+        skill_list = "\n".join(
+            f"  - **{name}**: `read_file .vingobot/.taiji/cognition/skills/{name}/SKILL.md` 查看技能定义"
+            for name in discovered_skill_names
+        )
+        system_prompt += (
+            f"\n\n## 认知资产指引（强制性——认知库优先）\n"
+            f"当前卦象 **{trigram_label}卦** 已注入以下技能工具（可直接调用）：\n"
+            f"{skill_list}\n\n"
+            f"**优先级规则（不可跳过）**：\n"
+            f"1. ⭐ 这些技能是本卦默认方案——你的**首轮必须先 read_file 以上技能的 SKILL.md**，了解已有模板/脚本/流程\n"
+            f"2. 如果技能提供了现成模板（如 remotion_init_project），**必须调用技能工具**，禁止自己从零搭建（npm init / pip install / npx create）\n"
+            f"3. 如果技能不适用 → 在 execution-facts 中写明理由（`skill_bypass_reason: ...`），然后走自己的方案\n"
+            f"4. 技能工具调用失败 → 查看错误输出后用不同参数重试一次，不要放弃改用 ad-hoc 方案\n"
+        )
+    else:
+        system_prompt += (
+            f"\n\n## 认知资产指引（强制性）\n"
+            f"当前卦象 {trigram_label}卦 无匹配的预注入技能。"
+            f"检查工具列表，如存在以 `skill_` 或 `remotion_` 前缀开头的工具，说明 Weaver 已注入可使用。\n"
+            f"## 认知库路径\n"
+            f"- L3 网格: `list_directory` 浏览 grids/ 目录，`read_file` 读取匹配 {trigram_label} 卦的 JSON 网格文件获取完整 workflow\n"
+            f"- L2 模型: `list_directory` 浏览 models/ 目录查看可用经验模型，`read_file` 读取 .json 或 .md 文件\n"
+            f"- L1 技能: `list_directory` 浏览 skills/ 目录查看已有技能，`read_file` 读取 SKILL.md\n"
+        )
 
     # 8. Loop detection
     loop_warning = _detect_loop(facts)
@@ -598,16 +604,8 @@ async def weave(
     if term_directive:
         system_prompt += f"\n\n{term_directive}"
 
-    # 9. Extract discovered skill names
-    grid_skills = []
-    if skill_tools:
-        for td in skill_tools:
-            try:
-                name = td["function"]["name"]
-                if name.startswith("skill_"):
-                    grid_skills.append(name[6:])
-            except (KeyError, IndexError):
-                pass
+    # 9. Use discovered skill names directly (from grid, not tool-name inference)
+    grid_skills = list(discovered_skill_names)
 
     return WeaverOutput(
         system_prompt=system_prompt,
@@ -648,6 +646,7 @@ def _build_system_prompt_v2(
     exec_failures = sum(
         1 for f in facts
         if getattr(f, "execution_status", "") == "exec_failed"
+        and not getattr(f, "is_verification_round", False)
     )
     if exec_failures >= 2:
         parts.append(
@@ -739,6 +738,11 @@ def _layer_goal_context(
                     meta_parts.append("自驱执行: 是")
                 if meta_parts:
                     parts.append(f"\n## 目标状态\n{' | '.join(meta_parts)}")
+
+            # ── Known traps (per-goal anti-pattern table) ──
+            known_traps = getattr(goal_context, "known_traps_text", "") or ""
+            if known_traps:
+                parts.append(f"\n{known_traps}")
 
             # Trajectory snapshot
             ts = getattr(goal_context, "trajectory_snapshot", "") or ""
@@ -907,6 +911,34 @@ def _detect_loop(facts: list[RoundExecutionFact]) -> str | None:
                 "你正在反复执行 list_directory（成功）然后尝试读取不存在的文件（失败）。"
                 "请停止这种循环。你需要的信息可能位于 目标目录 中（参考上面的目标目录文件清单），"
                 "而不是当前任务目录。使用 read_file 读取目标目录中的实际文件（如 blueprint.md 等）来获取所需信息。"
+            )
+
+    # Pattern 3: Consecutive veto rounds — Yang keeps proposing read-only
+    # calls that Action refuses to execute, forming a deadlock.
+    if len(facts) >= 3:
+        last_3 = facts[-3:]
+        veto_count = sum(
+            1 for f in last_3
+            if f.execution_status == "skipped"
+            and f.tool_call_count > 0
+            and f.yin_decision in ("approved", "modified")
+        )
+        if veto_count >= 3:
+            return (
+                "## ⚠️ 死锁检测：连续 3 轮被行动节点拒绝执行\n\n"
+                "你连续 3 轮提出了只读工具调用（read_file/list_directory），"
+                "但行动节点每次都将它们拦截——因为纯读取不产生交付物，"
+                "而系统已经进入需要产出的阶段。\n\n"
+                "**注意：exec 中的诊断命令（ls/head/wc/cat/grep 等）也被视为只读。**"
+                "如果你在用 exec 做文件内容检查，这些不会被视为产出，"
+                "请改用 write_file 直接写入成果。\n\n"
+                "**打破死锁的唯一方法：本轮不要提出任何 read_file 或 list_directory。**\n"
+                "直接用 write_file 写入成果文件（分析报告、代码、文档等），"
+                "或用 exec 执行真正的任务脚本（build/render/generate 等）。"
+                "你已有的知识和第 1 轮的收集结果足够支撑第一步产出。\n\n"
+                "如果你确实 100% 确定需要读取某个特定文件才能继续："
+                "只提 1 个 read_file + 1 个 write_file 搭配使用，"
+                "不要提纯读取批次。"
             )
 
     return None
